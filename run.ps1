@@ -11,7 +11,12 @@
         throw 'Set Repository to username/repository and Branch to your GitHub branch name.'
     }
     $localRoot = [Environment]::GetFolderPath('LocalApplicationData')
-    $directory = Join-Path $localRoot ('DeltaJoiner\' + $Repository.Replace('/', '\'))
+    if ($env:LAUNCHER_DIRECTORY) {
+        if (-not [IO.Path]::IsPathRooted($env:LAUNCHER_DIRECTORY)) { throw 'The starter folder must be an absolute path.' }
+        $directory = [IO.Path]::GetFullPath($env:LAUNCHER_DIRECTORY)
+    } else {
+        $directory = Join-Path $localRoot ('DeltaJoiner\' + $Repository.Replace('/', '\'))
+    }
     $baseUrl = 'https://raw.githubusercontent.com/' + $Repository + '/' + [Uri]::EscapeDataString($Branch)
     $null = [IO.Directory]::CreateDirectory($directory)
     $hash = [Security.Cryptography.SHA256]::Create()
