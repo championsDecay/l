@@ -1,6 +1,6 @@
 
 & {
-    $Repository = 'championsDecay/j'
+    $Repository = 'championsDecay/l'
     $Branch = 'main'
 
     $ErrorActionPreference = 'Stop'
