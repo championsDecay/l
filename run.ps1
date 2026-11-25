@@ -43,10 +43,14 @@
             $oldProtocol = [Net.ServicePointManager]::SecurityProtocol
             try {
                 [Net.ServicePointManager]::SecurityProtocol = $oldProtocol -bor [Net.SecurityProtocolType]::Tls12
+                $downloadQuery = '?launcher=' + [guid]::NewGuid().ToString('N')
+                $downloadHeaders = @{'Cache-Control'='no-cache';'Pragma'='no-cache'}
                 Invoke-WebRequest -UseBasicParsing -Uri ($baseUrl + '/launcher.cmd') -OutFile $download -TimeoutSec 60
+                Invoke-WebRequest -UseBasicParsing -Uri ($baseUrl + '/launcher.cmd' + $downloadQuery) -Headers $downloadHeaders -OutFile $download -TimeoutSec 60
                 
                 if (-not [IO.File]::Exists($config)) {
                     Invoke-WebRequest -UseBasicParsing -Uri ($baseUrl + '/config.example.ini') -OutFile (Join-Path $stage 'config.ini') -TimeoutSec 60
+                    Invoke-WebRequest -UseBasicParsing -Uri ($baseUrl + '/config.example.ini' + $downloadQuery) -Headers $downloadHeaders -OutFile (Join-Path $stage 'config.ini') -TimeoutSec 60
                 }
             } finally { [Net.ServicePointManager]::SecurityProtocol = $oldProtocol }
             $content = [IO.File]::ReadAllText($download)
