@@ -61,7 +61,7 @@ function Start-LauncherProcess {
 function ConvertTo-LauncherConfigKey {
     param([string]$Name)
     if($Name -ieq 'MaxRestoringInstances'){return 'MaxReplacingInstances'}
-    if($Name -match '^(?!(?:Launcher|Game|Cloudflare|LdPlayer))[A-Za-z]+(Package|OpenTimeout|RelaunchDelay)$'){return ('Launcher'+$Matches[1])}
+    if($Name -match '^(?:Delta|Noka)(Package|OpenTimeout|RelaunchDelay)$'){return ('Launcher'+$Matches[1])}
     return $Name
 }
 
@@ -8068,6 +8068,22 @@ function New-LauncherNativeResetInstance {
 
 function Save-LauncherUiCookie { throw 'Cookie editing has been replaced by automatic game-data snapshots.' }
 
+function New-LauncherWorkerStartInfo {
+    param([string]$LauncherPath,[string]$Directory,[string]$RunDirectory,[ValidateSet('worker','reset')][string]$Mode)
+    $code='$ProgressPreference=''SilentlyContinue''; $ErrorActionPreference=''Stop''; $content=[IO.File]::ReadAllText($env:LAUNCHER_FLOW_FILE); $marker='':LAUNCHER_''+''POWERSHELL''; $offset=$content.LastIndexOf($marker,[StringComparison]::Ordinal); if($offset -lt 0){throw ''The launcher CMD is incomplete: its embedded PowerShell payload is missing.''}; & ([scriptblock]::Create($content.Substring($offset+$marker.Length)))'
+    $info=New-Object Diagnostics.ProcessStartInfo
+    $info.FileName=Get-LauncherPowerShellPath
+    $info.Arguments='-NoProfile -STA -NonInteractive -InputFormat Text -OutputFormat Text -EncodedCommand '+[Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($code))
+    $info.UseShellExecute=$false;$info.CreateNoWindow=$true;$info.WorkingDirectory=$Directory
+    $info.RedirectStandardOutput=$true;$info.RedirectStandardError=$true
+    $info.StandardOutputEncoding=[Text.UTF8Encoding]::new($false);$info.StandardErrorEncoding=[Text.UTF8Encoding]::new($false)
+    $info.EnvironmentVariables['LAUNCHER_FLOW_FILE']=$LauncherPath
+    $info.EnvironmentVariables['LAUNCHER_FLOW_MODE']=$Mode
+    $info.EnvironmentVariables['LAUNCHER_FLOW_RUN_DIRECTORY']=$RunDirectory
+    $info.EnvironmentVariables['LAUNCHER_FLOW_STOP_FILE']=Join-Path $RunDirectory 'stop.request'
+    return $info
+}
+
 function Start-LauncherUiRun {
     param([ValidateSet('Run','Reset')][string]$Operation='Run')
     if($Ui.ForceClosePending -or $Ui.ForceCloseTask){throw 'Wait for force close to finish.'}
@@ -8084,17 +8100,8 @@ function Start-LauncherUiRun {
     }
     $directory=Join-Path ([IO.Path]::GetTempPath()) ('launcher-'+[guid]::NewGuid().ToString('N'))
     $null=New-Item -ItemType Directory -Path $directory
-    $info=New-Object Diagnostics.ProcessStartInfo
-    $info.FileName=Get-LauncherPowerShellPath
-    $info.Arguments='-NoProfile -STA -NonInteractive -InputFormat Text -OutputFormat Text -Command "'+ '$content=[IO.File]::ReadAllText($env:LAUNCHER_FLOW_FILE); $marker=''# POWER''+''SHELL START''; & ([scriptblock]::Create($content.Substring($content.LastIndexOf($marker)+$marker.Length)))' +'"'
-    $info.UseShellExecute=$false; $info.CreateNoWindow=$true
-    $info.WorkingDirectory=$Ui.Directory
-    $info.RedirectStandardOutput=$true;$info.RedirectStandardError=$true
-    $info.StandardOutputEncoding=[Text.UTF8Encoding]::new($false);$info.StandardErrorEncoding=[Text.UTF8Encoding]::new($false)
-    $info.EnvironmentVariables['LAUNCHER_FLOW_FILE']=$Ui.LauncherPath
-    $info.EnvironmentVariables['LAUNCHER_FLOW_MODE']=if($Operation -eq 'Reset'){'reset'}else{'worker'}
-    $info.EnvironmentVariables['LAUNCHER_FLOW_RUN_DIRECTORY']=$directory
-    $info.EnvironmentVariables['LAUNCHER_FLOW_STOP_FILE']=Join-Path $directory 'stop.request'
+    $mode=if($Operation -eq 'Reset'){'reset'}else{'worker'}
+    $info=New-LauncherWorkerStartInfo -LauncherPath $Ui.LauncherPath -Directory $Ui.Directory -RunDirectory $directory -Mode $mode
     $process=New-Object Diagnostics.Process;$process.StartInfo=$info
     Initialize-LauncherOutputReader
     $sink=[LauncherOutputReader]::new($process,(Join-Path $directory 'worker.log'))
