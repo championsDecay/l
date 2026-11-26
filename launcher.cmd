@@ -292,6 +292,22 @@ function Get-HybridMarkerPhase {
     }
     return [LauncherMarkerPixels]::Inspect($capture,$Bounds[0],$Bounds[1],$Bounds[2],$Bounds[3])
 }
+function Copy-CurrentInstanceReplacementSd {
+    param($Settings,$Journal,[string]$Target)
+    $vms=Join-Path $Settings.LdPlayerInstallPath 'vms'
+    $source=Join-Path $vms "leidian$($Journal.OldId)\sdcard.vmdk"
+    if($Journal.SdSource -cne 'CurrentInstance' -or -not $Journal.CurrentSdHash -or [IO.Path]::GetFullPath([string]$Journal.CurrentSdPath) -ine [IO.Path]::GetFullPath($source)){
+        throw 'The current-instance SD disk does not match the replacement journal. Old emulator files were kept.'
+    }
+    Assert-MovedInstanceSourceClosed $Settings $Journal.OldId
+    Copy-BackupReplacementDisk $Settings $source $Target $Journal.SdLength $Journal.CurrentSdHash $Journal.SourceSdUuid $Journal.SdUuid -SourceRoot $vms
+    Set-TemplateDiskHostUuid $Target $Journal.SdUuid
+    $receiptPath=$Target+'.verified.json'
+    $record=ConvertFrom-Json ([IO.File]::ReadAllText($receiptPath));$item=Get-Item -LiteralPath $Target
+    if($record.TargetTicks -ne $item.LastWriteTimeUtc.Ticks){
+        Write-TemplateStageManifest $receiptPath @{SourceHash=$Journal.CurrentSdHash;TargetHash=(Get-FileHash -LiteralPath $Target).Hash;TargetTicks=$item.LastWriteTimeUtc.Ticks}
+    }
+}
 function Get-DiskBackupRoot {
     param($Settings=$Config)
     return (Join-Path ([IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($Settings.ConfigFilePath))) 'backup')
@@ -664,8 +680,8 @@ function Show-LauncherResetTemplateWarning {
     [Windows.Forms.MessageBox]::Show($Ui.Form,$Message,'Reset blocked: LDPlayer 0 files missing',[Windows.Forms.MessageBoxButtons]::OK,[Windows.Forms.MessageBoxIcon]::Warning)|Out-Null
 }
 function Copy-BackupReplacementDisk {
-    param($Settings,[string]$Source,[string]$Target,[long]$Length,[string]$Hash,[string]$SourceUuid,[string]$TargetUuid)
-    $root=Get-DiskBackupRoot $Settings;$vms=Join-Path $Settings.LdPlayerInstallPath 'vms'
+    param($Settings,[string]$Source,[string]$Target,[long]$Length,[string]$Hash,[string]$SourceUuid,[string]$TargetUuid,[string]$SourceRoot='')
+    $root=if($SourceRoot){$SourceRoot}else{Get-DiskBackupRoot $Settings};$vms=Join-Path $Settings.LdPlayerInstallPath 'vms'
     Assert-InstanceReplacementDirectory $Source $root
     Assert-InstanceReplacementDirectory $Target $vms
     $receiptPath=$Target+'.verified.json'
@@ -675,7 +691,7 @@ function Copy-BackupReplacementDisk {
         if($receipt.SourceHash -ieq $Hash -and $receipt.TargetTicks -eq $item.LastWriteTimeUtc.Ticks){return}
         if($receipt.SourceHash -ieq $Hash -and (Get-FileHash -LiteralPath $Target).Hash -ieq $receipt.TargetHash){return}
     }
-    if(-not (Test-ReplacementDiskFile $Source $Length @($SourceUuid))){throw 'The saved replacement disk is missing or has changed. Backup files were preserved.'}
+    if(-not (Test-ReplacementDiskFile $Source $Length @($SourceUuid))){throw "The replacement source disk is missing or has changed: $Source. Existing emulator and backup files were preserved."}
     $temporary=$Target+'.copy.tmp';Assert-InstanceReplacementDirectory $temporary $vms
     Initialize-OfflineDiskNative
     $copied=[LauncherOfflineSession]::CopyVerified($Source,$temporary,[string]$Settings.StopFilePath,$false)
@@ -3317,12 +3333,12 @@ function New-InstanceReplacementPlan {
     if((Test-Path -LiteralPath $target) -or (Test-Path -LiteralPath $targetConfig)){throw 'The allocated replacement ID already has files; no existing instance will be overwritten.'}
     $sourceConfig=Join-Path $backup.Directory 'leidian.config'
     $sourceVm=Join-Path $backup.Directory 'leidian.vbox'
-    $oldData=Join-Path $backup.Directory 'data.vmdk';$sd=Join-Path $backup.Directory 'sdcard.vmdk'
+    $oldData=Join-Path $backup.Directory 'data.vmdk';$sd=Join-Path $old 'sdcard.vmdk'
     $missing=New-Object 'System.Collections.Generic.List[string]'
     $copyData=if($TemplateData){(Get-LauncherTemplateFiles $Settings).DataFile}else{$oldData}
     if($TemplateData){$null=Resolve-LauncherRecoverySource -Settings $Settings -CheckClosed}
     foreach($file in @($sourceConfig,$sourceVm,$copyData,$sd)){
-        if(-not ($TemplateData -and $file -ceq $copyData)){Assert-InstanceReplacementDirectory $file $backupRoot}
+        if(-not ($TemplateData -and $file -ceq $copyData)){if($file -ceq $sd){Assert-InstanceReplacementDirectory $file $vms}else{Assert-InstanceReplacementDirectory $file $backupRoot}}
         if(-not [IO.File]::Exists($file)){$missing.Add($file)}
     }
     if($missing.Count){throw ('Replacement source file missing or inaccessible: '+($missing.ToArray() -join '; ')+'. No replacement files were copied; the original instance and saved app data were kept.')}
@@ -3394,11 +3410,15 @@ function Prepare-MovedInstanceReplacementFiles {
     if($Journal.Phase -eq 'Preparing'){
         $plan=New-InstanceReplacementPlan $Settings $Journal.OldId $Journal.NewId
         $backup=Get-DiskBackupEntry $Settings $Journal.OldId
+        $sdItem=Get-Item -LiteralPath $plan.SourceSd
+        Write-FlowStatus "Replacement $($Journal.OldId) -> $($Journal.NewId): using data.vmdk from the saved backup and sdcard.vmdk from the closed current emulator."
+        $sdHash=(Get-FileHash -LiteralPath $plan.SourceSd -Algorithm SHA256).Hash
         foreach($entry in @{
             SourceKind='AffectedInstance';DataSource='DiskBackup';TransferMode='CopyDelete';BackupDirectory=$backup.Directory
+            SdSource='CurrentInstance';CurrentSdPath=$plan.SourceSd;CurrentSdHash=$sdHash;CurrentSdInstalledVerified=$false
             SourceDataUuid=(Get-TemplateDiskDescriptor $plan.CopyData).Uuid;SourceSdUuid=(Get-TemplateDiskDescriptor $plan.SourceSd).Uuid
-            DataLength=$backup.Manifest.Files.'data.vmdk'.Length;SdLength=$backup.Manifest.Files.'sdcard.vmdk'.Length
-            BackupDataHash=$backup.Manifest.Files.'data.vmdk'.Sha256;BackupSdHash=$backup.Manifest.Files.'sdcard.vmdk'.Sha256
+            DataLength=$backup.Manifest.Files.'data.vmdk'.Length;SdLength=$sdItem.Length
+            BackupDataHash=$backup.Manifest.Files.'data.vmdk'.Sha256;BackupSdHash=$sdHash
             PreparedVmText=$plan.VmText;PreparedConfigText=$plan.ConfigText;DataUuid=$plan.DataUuid;SdUuid=$plan.SdUuid
         }.GetEnumerator()){$Journal|Add-Member NoteProperty $entry.Key $entry.Value -Force}
         $Journal.Phase='Copying';Write-TemplateStageManifest $JournalPath $Journal
@@ -3409,7 +3429,11 @@ function Prepare-MovedInstanceReplacementFiles {
     $null=[IO.Directory]::CreateDirectory((Join-Path $stage 'payload'))
     foreach($disk in @(@('data.vmdk',$Journal.DataLength,$Journal.BackupDataHash,$Journal.SourceDataUuid,$Journal.DataUuid),@('sdcard.vmdk',$Journal.SdLength,$Journal.BackupSdHash,$Journal.SourceSdUuid,$Journal.SdUuid))){
         $target=Join-Path $stage ('payload\'+$disk[0])
-        Copy-BackupReplacementDisk $Settings (Join-Path $backup.Directory $disk[0]) $target $disk[1] $disk[2] $disk[3] $disk[4]
+        if($disk[0] -eq 'sdcard.vmdk' -and $Journal.SdSource -eq 'CurrentInstance'){
+            Copy-CurrentInstanceReplacementSd $Settings $Journal $target
+        }else{
+            Copy-BackupReplacementDisk $Settings (Join-Path $backup.Directory $disk[0]) $target $disk[1] $disk[2] $disk[3] $disk[4]
+        }
         Set-TemplateDiskHostUuid $target $disk[4]
         $verified=Join-Path ([IO.Path]::GetDirectoryName($target)) ([IO.Path]::GetFileName($target)+'.verified.json')
         $record=ConvertFrom-Json ([IO.File]::ReadAllText($verified));$item=Get-Item -LiteralPath $target
@@ -3573,9 +3597,13 @@ function Install-InstanceReplacementFiles {
             $source=Join-Path $vms "leidian$($Journal.OldId)\$($disk[0])"
             if($disk[0] -eq 'data.vmdk' -and $Journal.DataSource -eq 'Template0'){$source=(Get-LauncherTemplateFiles $Settings).DataFile;$null=Resolve-LauncherRecoverySource $Settings -CheckClosed}
                         if($Journal.DataSource -eq 'DiskBackup'){
-                $source=Join-Path $Journal.BackupDirectory $disk[0]
-                $hash=if($disk[0] -eq 'data.vmdk'){$Journal.BackupDataHash}else{$Journal.BackupSdHash}
-                Copy-BackupReplacementDisk $Settings $source $installed $disk[1] $hash $disk[2] $disk[3]
+                if($disk[0] -eq 'sdcard.vmdk' -and $Journal.SdSource -eq 'CurrentInstance'){
+                    Copy-CurrentInstanceReplacementSd $Settings $Journal $installed
+                }else{
+                    $source=Join-Path $Journal.BackupDirectory $disk[0]
+                    $hash=if($disk[0] -eq 'data.vmdk'){$Journal.BackupDataHash}else{$Journal.BackupSdHash}
+                    Copy-BackupReplacementDisk $Settings $source $installed $disk[1] $hash $disk[2] $disk[3]
+                }
             }else{Copy-ReplacementDiskFile $source $installed $disk[1] $disk[2] $disk[3] $vms}
             Set-TemplateDiskHostUuid $installed $disk[3]
         }
@@ -3622,6 +3650,14 @@ function Assert-InstalledInstanceReplacement {
     $xml=[xml]::new();$xml.XmlResolver=$null;$xml.Load($vm)
     $machine=$xml.SelectSingleNode('//*[local-name()="Machine"]');$data=$xml.SelectSingleNode('//*[local-name()="HardDisk" and @location="data.vmdk"]')
     if(-not $machine -or $machine.name -cne "leidian$($Journal.NewId)" -or -not $data -or $data.uuid.Trim('{}') -ine $Journal.DataUuid){throw 'Installed replacement VM identity does not match its disks.'}
+    if($Journal.SdSource -eq 'CurrentInstance'){
+        if($current.Running){
+            if(-not $Journal.CurrentSdInstalledVerified){throw 'The current-instance SD disk has not completed verification. Old emulator cleanup was postponed.'}
+        }else{
+            Copy-CurrentInstanceReplacementSd $Settings $Journal (Join-Path $target 'sdcard.vmdk')
+            $Journal|Add-Member NoteProperty CurrentSdInstalledVerified $true -Force
+        }
+    }
     $Journal|Add-Member NoteProperty TargetRunningVerified ([bool]$current.Running) -Force
 }
 
