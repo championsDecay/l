@@ -371,6 +371,33 @@ function Save-OfflineEmulatorBackup {
         Write-Host "LDPlayer $Id backup completed and verified."
     }finally{foreach($handle in $locks){$handle.Dispose()}}
 }
+function Get-LauncherTemplateFileStatus {
+    param($Settings)
+    $install=[string]$Settings.LdPlayerInstallPath
+    if(-not $install -and $Settings.LdConsolePath){$install=[IO.Path]::GetDirectoryName([string]$Settings.LdConsolePath)}
+    if(-not $install){$install='C:\LDPlayer\LDPlayer9'}
+    $install=[IO.Path]::GetFullPath([Environment]::ExpandEnvironmentVariables($install.Trim('"')))
+    $vms=Join-Path $install 'vms';$vm=Join-Path $vms 'leidian0';$config=Join-Path $vms 'config\leidian0.config'
+    Assert-InstanceReplacementDirectory $vms $install
+    $missing=New-Object 'System.Collections.Generic.List[string]'
+    $registration=$null
+    foreach($name in @('leidian.vbox','leidian.vbox-prev','.joiner-recovered.vbox')){
+        $candidate=Join-Path $vm $name;Assert-InstanceReplacementDirectory $candidate $vms
+        if([IO.File]::Exists($candidate) -and ([IO.FileInfo]$candidate).Length -gt 0){$registration=$candidate;break}
+    }
+    if(-not $registration){$missing.Add((Join-Path $vm 'leidian.vbox'))}
+    $data=Join-Path $vm 'data.vmdk';$sd=Join-Path $vm 'sdcard.vmdk'
+    foreach($path in @($data,$sd,$config)){
+        Assert-InstanceReplacementDirectory $path $vms
+        if(-not [IO.File]::Exists($path) -or ([IO.FileInfo]$path).Length -le 0){$missing.Add($path)}
+    }
+    $message=''
+    if($missing.Count){
+        $message="LDPlayer 0 is missing required template files (or they are empty):`r`n`r`n"+($missing.ToArray() -join "`r`n")+"`r`n`r`nRestore these files before using Reset."
+        if(-not $registration){$message+="`r`nOpen LDPlayer 0 once to generate its VM registration, then close it before using Reset."}
+    }
+    return @{Missing=$missing.ToArray();Message=$message;Template=@{Root=$vm;VmDirectory=$vm;ConfigFile=$config;Files=@($data,$sd,$registration,$config);DataFile=$data;SdFile=$sd;VmFile=$registration}}
+}
 function Clear-LegacyDiskBackupState {
     $directory=[IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($Config.ConfigFilePath))
     $legacy=Join-Path $directory 'app-data'
@@ -432,6 +459,19 @@ function Get-DiskBackupEntry {
         if($Verify -and (Get-FileHash -LiteralPath $file).Hash -ine $record.Sha256){throw "Backup $Id failed $name verification. Its files were preserved."}
     }
     return @{Directory=$directory;Manifest=$entry}
+}
+function Update-LauncherTemplateWarningUi {
+    if(-not $Ui -or -not $Ui.Form){return}
+    try{
+        $settings=Read-LauncherUiConfig $Ui.ConfigPath
+        $status=Get-LauncherTemplateFileStatus $settings
+        if(-not $status.Missing.Count){return}
+        Set-LauncherUiProperty $Ui.Backup Text ('Reset unavailable: LDPlayer 0 template files are missing or empty. '+($status.Missing -join '; '))
+        Set-LauncherUiProperty $Ui.Backup ForeColor ([Drawing.Color]::FromArgb(255,185,95))
+    }catch{
+        Set-LauncherUiProperty $Ui.Backup Text ('Reset template check: '+$_.Exception.Message)
+        Set-LauncherUiProperty $Ui.Backup ForeColor ([Drawing.Color]::FromArgb(255,185,95))
+    }
 }
 function Assert-AllBackupEmulatorsClosed {
     param($Settings=$Config)
@@ -618,6 +658,10 @@ public static class LauncherOfflineSession {
 
 '@}}
     finally{[Threading.Monitor]::Exit($gate)}
+}
+function Show-LauncherResetTemplateWarning {
+    param([string]$Message)
+    [Windows.Forms.MessageBox]::Show($Ui.Form,$Message,'Reset blocked: LDPlayer 0 files missing',[Windows.Forms.MessageBoxButtons]::OK,[Windows.Forms.MessageBoxIcon]::Warning)|Out-Null
 }
 function Copy-BackupReplacementDisk {
     param($Settings,[string]$Source,[string]$Target,[long]$Length,[string]$Hash,[string]$SourceUuid,[string]$TargetUuid)
@@ -4204,24 +4248,9 @@ function Resolve-LauncherRecoverySource {
 
 function Get-LauncherTemplateFiles {
     param($Settings,[string]$Directory)
-    $install=[string]$Settings.LdPlayerInstallPath
-    if(-not $install -and $Settings.LdConsolePath){$install=[IO.Path]::GetDirectoryName([string]$Settings.LdConsolePath)}
-    if(-not $install){$install='C:\LDPlayer\LDPlayer9'}
-    $install=[IO.Path]::GetFullPath([Environment]::ExpandEnvironmentVariables($install.Trim('"')))
-    $vms=Join-Path $install 'vms';$vm=Join-Path $vms 'leidian0';$config=Join-Path $vms 'config\leidian0.config'
-    Assert-InstanceReplacementDirectory $vms $install
-    $registration=$null
-    foreach($name in @('leidian.vbox','leidian.vbox-prev','.joiner-recovered.vbox')){
-        $candidate=Join-Path $vm $name;Assert-InstanceReplacementDirectory $candidate $vms
-        if([IO.File]::Exists($candidate) -and (Get-Item -LiteralPath $candidate).Length -gt 0){$registration=$candidate;break}
-    }
-    if(-not $registration){throw 'LDPlayer 0 has no VM registration file in its installation folder. Open LDPlayer 0 once to let LDPlayer generate it, then close it before using it as the template.'}
-    $files=@((Join-Path $vm 'data.vmdk'),(Join-Path $vm 'sdcard.vmdk'),$registration,$config)
-    foreach($path in $files){
-        Assert-InstanceReplacementDirectory $path $vms
-        if(-not [IO.File]::Exists($path) -or (Get-Item -LiteralPath $path).Length -le 0){throw "Installed LDPlayer 0 is missing a required template file: $path"}
-    }
-    return @{Root=$vm;VmDirectory=$vm;ConfigFile=$config;Files=$files;DataFile=$files[0];SdFile=$files[1];VmFile=$files[2]}
+    $status=Get-LauncherTemplateFileStatus $Settings
+    if($status.Missing.Count){throw $status.Message}
+    return $status.Template
 }
 
 function Get-PendingTemplateStage {
@@ -6804,6 +6833,15 @@ function Confirm-LauncherUiReset {
     $null=$Ui.Settings.EndEdit();$count=[int]$Ui.ResetCount.Value
     Save-LauncherUiSettings
     $settings=Get-LauncherResetSettings $Ui.ConfigPath
+    try{$null=Get-LauncherResetTemplateFiles $settings}
+    catch{
+        $message=$_.Exception.Message
+        Set-LauncherUiProperty $Ui.Backup Text $message
+        Set-LauncherUiProperty $Ui.Backup ForeColor ([Drawing.Color]::FromArgb(255,185,95))
+        Add-LauncherUiLog ($message+"`r`n")
+        Show-LauncherResetTemplateWarning $message
+        return
+    }
     $null=Assert-LauncherResetOnlyTemplate $settings
     $message="Create exactly $count new instances (IDs 1-$count) by copying the existing LDPlayer 0?`r`n`r`nOnly LDPlayer 0 may exist before starting. No emulator is deleted. Template 0 is kept and closed before copying.`r`n`r`nAll locally saved app-data snapshots, local metadata will be deleted. Exclusions and recovery queues are reset.`r`n`r`nEach copy uses native new-instance followed by direct file copying, without the clone feature."
     if($count -eq 0){$message=$message.Replace('Create exactly 0 new instances (IDs 1-0)','Keep template 0 without creating new instances')}
@@ -7027,6 +7065,7 @@ function Update-LauncherUi {
     }
     $Ui.LastWasBusy=$busy
     if(([datetime]::UtcNow-$Ui.LastAccountRefresh).TotalSeconds -ge 3){Read-LauncherUiAccounts;$Ui.LastAccountRefresh=[datetime]::UtcNow}
+    Update-LauncherTemplateWarningUi
     Update-DiskBackupWarningUi
 }
 
