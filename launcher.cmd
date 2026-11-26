@@ -21,7 +21,873 @@ powershell.exe -NoProfile -STA -NonInteractive %flowWindow% -Command "$content =
 set "flowExit=%ERRORLEVEL%"
 if not "%flowExit%"=="0" pause
 exit /b %flowExit%
-:LAUNCHER_POWERSHELL
+:LAUNCHER_POWERSHELLfunction Reset-HybridAppForRecovery {
+    param([string]$Package,$App,[string]$Reason)
+    $App.Ready=$false;$App.LinkSentUtc=$null;$App.JoiningUtc=$null;$App.Opened=$false;$App.OpenedUtc=$null;$App.OpenRequestUtc=$null;$App.NegativeCount=0;$App.LastNegativeTicks=0L;$App.RecoveryCheckUtc=$null
+    $script:AppWindowSnapshotTicks=0;$script:HybridCapture=$null
+    $script:PoolActivePackage=$Package;$script:RecoveryScope='Game'
+    if($script:PoolRole -eq 'Monitor'){
+        $null=Request-MonitorQuickRecovery -Package $Package
+        Assert-PoolSetupTurn
+    }
+    if(-not (Test-EmulatorResponsive)) {
+        Close-NoRootManagedInstance
+        $failure=[OperationCanceledException]::new('Android is not responding. The emulator is closed and queued for a fresh setup turn.')
+        $failure.Data['PoolNeedsSetup']=$true;throw $failure
+    }
+    Invoke-Ld -Arguments @('killapp','--index',"$InstanceIndex",'--packagename',$Package)|Out-Null
+    Write-FlowStatus ($Reason+' Closed the affected app; its setup turn will reopen it.')
+}
+function Get-HybridMarkerBounds {
+    param([string]$Windows,[string]$Package)
+    $owner='\bpackage='+[regex]::Escape($Package)+'(?:\s|$)'
+    $blocks=[regex]::Matches($Windows,'(?ms)^\s*Window #\d+\s+Window\{[^\r\n]*\}:(?<body>.*?)(?=^\s*Window #\d+\s+Window\{|^\s*mGlobalConfiguration=|\z)')
+    $selected=$null;$best=-1
+    foreach($block in $blocks){
+        $body=$block.Groups['body'].Value
+        if($body -cnotmatch $owner -or $body -match '\bty=(?:APPLICATION_OVERLAY|SYSTEM_ALERT)\b' -or $body -notmatch '\bmHasSurface=true\b' -or $body -notmatch '(?m)^\s*isVisible=true\s*$'){continue}
+        $frame=[regex]::Match($body,'\bmFrame=\[(-?\d+),(-?\d+)\]\[(-?\d+),(-?\d+)\]')
+        if(-not $frame.Success){continue}
+        $x=[int]$frame.Groups[1].Value;$y=[int]$frame.Groups[2].Value
+        $width=[int]$frame.Groups[3].Value-$x;$height=[int]$frame.Groups[4].Value-$y
+        if($width -lt 32 -or $height -lt 32){continue}
+        $native=$block.Value -match ('(?m)^\s*Window #\d+\s+Window\{[^\r\n]*'+[regex]::Escape($Package)+'/com[.]roblox[.]client[.]ActivityNativeMain(?:\s|\})')
+        $rank=if($native){2}else{1}
+        if($rank -gt $best){$selected=@($x,$y,$width,$height);$best=$rank}
+    }
+    return $selected
+}
+function Get-HybridPresence {
+    param([string]$Package=$Config.GamePackage)
+    Initialize-HybridStatusNative
+    $accounts=Get-HybridSavedAccounts;$key="$InstanceIndex|$Package"
+    if(-not $accounts.ContainsKey($key)){return @{Available=$false;Type=-1;SampleTicks=0L;Error='Saved user ID is missing for this app.'}}
+    $ids=[long[]]@($accounts.Values|Sort-Object -Unique)
+    return [LauncherPcPresence]::Get([long]$accounts[$key],$ids,[math]::Max(3,$Config.GameCheckInterval),[string]$Config.StopFilePath)
+}
+function Get-HybridAppState {
+    param($Instance)
+    if($script:HybridBoot -ne $Instance.ProcessId -or -not $script:HybridApps){
+        $script:HybridBoot=$Instance.ProcessId;$script:HybridApps=@{};$script:HybridPresenceSamples=@{}
+        foreach($package in $Config.GamePackages){$script:HybridApps[$package]=@{Ready=$false;LinkSentUtc=$null;JoiningUtc=$null;LastState='';LastNegativeTicks=0L;NegativeCount=0;Opened=$false;OpenedUtc=$null;OpenRequestUtc=$null;RecoveryCheckUtc=$null}}
+    }
+    return $script:HybridApps
+}
+function Get-HybridSavedAccounts {
+    $root=Get-DiskBackupRoot $Config
+    $selection=(@($Config.LdPlayerIds|Sort-Object -Unique) -join ',')+'|'+($Config.GamePackages -join ',')
+    if($script:HybridAccounts -and $script:HybridAccountsSelection -ceq $selection -and $script:HybridAccountsCheckedUtc -and ([datetime]::UtcNow-$script:HybridAccountsCheckedUtc).TotalSeconds -lt 60){return $script:HybridAccounts}
+    $paths=@(foreach($id in @($Config.LdPlayerIds|Sort-Object -Unique)){foreach($pkg in $Config.GamePackages){Join-Path $root "$id\$pkg\account.json"}})
+    $key=(@(foreach($path in $paths){if([IO.File]::Exists($path)){$f=Get-Item -LiteralPath $path;$path+':'+$f.Length+':'+$f.LastWriteTimeUtc.Ticks}}) -join '|')
+    if($script:HybridAccountsKey -ceq $key -and $script:HybridAccounts){return $script:HybridAccounts}
+    $accounts=@{}
+    foreach($id in @($Config.LdPlayerIds|Sort-Object -Unique)){
+        foreach($pkg in $Config.GamePackages){
+            $path=Join-Path $root "$id\$pkg\account.json";Assert-InstanceReplacementDirectory $path $root
+            if(-not [IO.File]::Exists($path)){continue}
+            $entry=ConvertFrom-Json ([IO.File]::ReadAllText($path));$user=0L
+            if($entry.emulatorId -eq $id -and $entry.package -ceq $pkg -and [long]::TryParse([string]$entry.userId,[ref]$user) -and $user -gt 0){$accounts["$id|$pkg"]=$user}
+        }
+    }
+    $script:HybridAccountsKey=$key;$script:HybridAccounts=$accounts;$script:HybridAccountsSelection=$selection;$script:HybridAccountsCheckedUtc=[datetime]::UtcNow
+    return $accounts
+}
+function Get-HybridWindowSnapshot {
+    param([datetime]$Deadline=[datetime]::UtcNow.AddSeconds($Config.CommandTimeout),[switch]$Fresh)
+    $ttl=[math]::Max(1,[math]::Min(3,$Config.PollInterval))
+    if(-not $Fresh -and $script:AppWindowSnapshotInstance -eq $InstanceIndex -and $script:AppWindowSnapshotTicks -gt 0){
+        $age=([Diagnostics.Stopwatch]::GetTimestamp()-$script:AppWindowSnapshotTicks)/[double][Diagnostics.Stopwatch]::Frequency
+        if($age -lt $ttl -and $script:AppWindowSnapshot -match 'LAUNCHER_PID:'){return $script:AppWindowSnapshot}
+    }
+    $command='shell for p in '+($Config.GamePackages -join ' ')+'; do echo LAUNCHER_PID:$p:$(pidof $p); done; dumpsys -t 5 window windows'
+    $remaining=[math]::Ceiling(($Deadline-[datetime]::UtcNow).TotalSeconds)
+    if($remaining -le 0){throw (New-GameStatusReadError 'The app-window check reached its deadline.')}
+    $windows=Invoke-Android $command -TimeoutSeconds ([math]::Min(6,$remaining))
+    $windows=$windows -replace '\r+\n',"`n"
+    if($windows -notmatch 'WINDOW MANAGER WINDOWS|mCurrentFocus=' -or $windows -match 'DUMP TIMEOUT'){throw (New-GameStatusReadError 'Android app-window state is unavailable.')}
+    $script:AppWindowSnapshot=$windows;$script:AppWindowSnapshotInstance=$InstanceIndex;$script:AppWindowSnapshotTicks=[Diagnostics.Stopwatch]::GetTimestamp()
+    return $windows
+}
+function Initialize-HybridStatusNative {
+    if('LauncherPcPresence' -as [type]){return}
+    $gate=[string]::Intern('Launcher.HybridStatus');[Threading.Monitor]::Enter($gate)
+    try{if(-not ('LauncherPcPresence' -as [type])){Add-Type -ReferencedAssemblies @('System.dll','System.Core.dll','System.Web.Extensions.dll','System.Drawing.dll') -TypeDefinition @'
+using System;
+using System.IO;
+using System.Net;
+using System.Text;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Threading;
+using System.Threading.Tasks;
+using System.Web.Script.Serialization;
+using System.Drawing;
+
+public sealed class LauncherPresenceResult {
+    public bool Available;
+    public int Type=-1;
+    public long SampleTicks;
+    public string Error="";
+}
+public static class LauncherPcPresence {
+    static readonly object gate=new object();
+    static readonly Dictionary<long,LauncherPresenceResult> results=new Dictionary<long,LauncherPresenceResult>();
+    static readonly HashSet<long> requested=new HashSet<long>();
+    static bool busy;
+    static DateTime next=DateTime.MinValue;
+    static string failure="Waiting for a PC presence response.";
+    static int failures;
+    public static LauncherPresenceResult Get(long id,long[] ids,int interval,string stop){
+        lock(gate){
+            requested.Clear();
+            foreach(long user in ids)if(user>0)requested.Add(user);
+            if(id>0)requested.Add(id);
+            DateTime now=DateTime.UtcNow;
+            if(!busy&&now>=next&&!File.Exists(stop)){
+                busy=true;var batch=new List<long>(requested);batch.Sort();
+                Task.Run(delegate{Fetch(batch,Math.Max(3,interval),stop);});
+            }
+            LauncherPresenceResult value;
+            int batchDelay=Math.Max(interval,((requested.Count+49)/50)*2);
+            if(results.TryGetValue(id,out value)&&now.Ticks-value.SampleTicks<=TimeSpan.FromSeconds(Math.Max(10,batchDelay*2)).Ticks){
+                return new LauncherPresenceResult{Available=true,Type=value.Type,SampleTicks=value.SampleTicks};
+            }
+            return new LauncherPresenceResult{Available=false,Error=failure};
+        }
+    }
+    static void Fetch(List<long> ids,int interval,string stop){
+        int delay=Math.Max(interval,((ids.Count+49)/50)*2);string error="";
+        try{
+            for(int start=0;start<ids.Count;start+=50){
+                if(File.Exists(stop))return;
+                var batch=ids.GetRange(start,Math.Min(50,ids.Count-start));
+                string body="{\"userIds\":["+String.Join(",",batch.ToArray())+"]}";
+                var request=(HttpWebRequest)WebRequest.Create("https://presence.roblox.com/v1/presence/users");
+                request.Method="POST";request.ContentType="application/json";request.Accept="application/json";
+                request.UserAgent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/158.0.0.0 Safari/537.36";
+                request.Referer="https://www.roblox.com/";request.KeepAlive=true;request.Timeout=10000;request.ReadWriteTimeout=10000;
+                request.AutomaticDecompression=DecompressionMethods.GZip|DecompressionMethods.Deflate;
+                request.Headers["Accept-Language"]="en-US,en;q=0.9";request.Headers["Origin"]="https://www.roblox.com";
+                request.Headers["Sec-Fetch-Dest"]="empty";request.Headers["Sec-Fetch-Mode"]="cors";request.Headers["Sec-Fetch-Site"]="same-site";
+                request.Headers["Cache-Control"]="no-cache";request.Headers["Pragma"]="no-cache";
+                request.AllowAutoRedirect=false;request.CookieContainer=null;
+                ServicePointManager.SecurityProtocol|=SecurityProtocolType.Tls12;
+                byte[] data=Encoding.UTF8.GetBytes(body);request.ContentLength=data.Length;
+                try{
+                    using(Stream stream=request.GetRequestStream()){stream.Write(data,0,data.Length);}
+                    IAsyncResult pending=request.BeginGetResponse(null,null);
+                    using(WaitHandle wait=pending.AsyncWaitHandle){
+                        var timer=Stopwatch.StartNew();
+                        while(!wait.WaitOne(100)){
+                            if(File.Exists(stop)||timer.ElapsedMilliseconds>=10000){request.Abort();throw new IOException("PC presence request stopped or timed out.");}
+                        }
+                    }
+                    using(var response=(HttpWebResponse)request.EndGetResponse(pending)){
+                        if((int)response.StatusCode!=200)throw new IOException("PC presence response was not successful.");
+                        string json;
+                        using(var reader=new StreamReader(response.GetResponseStream(),Encoding.UTF8)){
+                            char[] buffer=new char[4096];var text=new StringBuilder();int n;
+                            while((n=reader.Read(buffer,0,buffer.Length))>0){text.Append(buffer,0,n);if(text.Length>1048576)throw new IOException("PC presence response exceeded its limit.");}
+                            json=text.ToString();
+                        }
+                        var serializer=new JavaScriptSerializer();serializer.MaxJsonLength=1048576;
+                        var root=serializer.DeserializeObject(json) as Dictionary<string,object>;object entries;
+                        if(root==null||!root.TryGetValue("userPresences",out entries))throw new IOException("PC presence response was incomplete.");
+                        var rows=entries as object[];if(rows==null)throw new IOException("PC presence response was incomplete.");
+                        long ticks=DateTime.UtcNow.Ticks;
+                        lock(gate){
+                            foreach(long user in batch)results.Remove(user);
+                            foreach(object item in rows){
+                                var row=item as Dictionary<string,object>;object user,kind;
+                                if(row==null||!row.TryGetValue("userId",out user)||!row.TryGetValue("userPresenceType",out kind))continue;
+                                long number=Convert.ToInt64(user);int type=Convert.ToInt32(kind);
+                                if(batch.Contains(number)&&type>=0&&type<=3)results[number]=new LauncherPresenceResult{Available=true,Type=type,SampleTicks=ticks};
+                            }
+                        }
+                    }
+                }catch(WebException ex){
+                    var response=ex.Response as HttpWebResponse;
+                    if(response!=null){using(response){
+                        int status=(int)response.StatusCode,retry;
+                        if(status==429){delay=60;if(Int32.TryParse(response.Headers["Retry-After"],out retry))delay=Math.Max(delay,Math.Min(3600,retry));}
+                        error="PC presence HTTP "+status+". Retrying without declaring a disconnect.";
+                    }}else error="PC presence connection failed. Retrying without declaring a disconnect.";
+                    throw new IOException(error);
+                }finally{request.Abort();}
+            }
+        }catch(Exception){if(error.Length==0)error="PC presence is unavailable. Retrying without declaring a disconnect.";}
+        finally{
+            lock(gate){
+                if(error.Length>0){failures++;results.Clear();delay=Math.Max(delay,Math.Min(60,3*(1<<Math.Min(failures,4))));failure=error;}
+                else{failures=0;failure="Waiting for a PC presence response.";}
+                next=DateTime.UtcNow.AddSeconds(delay);busy=false;
+            }
+        }
+    }
+}
+
+public static class LauncherMarkerPixels {
+    static bool ColorAt(Bitmap bitmap,int x,int y,int r,int g,int b,double scale){
+        if(x<0||y<0||x>=bitmap.Width||y>=bitmap.Height)return false;
+        Color c=bitmap.GetPixel(x,y);return Math.Abs(c.R-r*scale)<=12&&Math.Abs(c.G-g*scale)<=12&&Math.Abs(c.B-b*scale)<=12;
+    }
+    public static int Inspect(byte[] png,int left,int top,int width,int height){
+        if(png.Length<24||png.Length>33554432||png[0]!=137||png[1]!=80||png[2]!=78||png[3]!=71)throw new IOException("Invalid screen capture.");
+        long w=((long)png[16]<<24)|((long)png[17]<<16)|((long)png[18]<<8)|png[19];
+        long h=((long)png[20]<<24)|((long)png[21]<<16)|((long)png[22]<<8)|png[23];
+        if(w<=0||h<=0||w*h>16777216)throw new IOException("Screen capture exceeds its size limit.");
+        using(var stream=new MemoryStream(png,false))using(var bitmap=new Bitmap(stream)){
+            int x0=Math.Max(0,left),y0=Math.Max(0,top),x1=Math.Min(bitmap.Width,left+width),y1=Math.Min(bitmap.Height,top+height);
+            if(width<=0||height<=0){x0=0;y0=0;x1=bitmap.Width;y1=bitmap.Height;}
+            int scanRight=x0+Math.Max(16,(x1-x0)/5),scanTop=y1-Math.Max(24,(y1-y0)/3);
+            for(int y=Math.Max(y0,scanTop);y<y1;y++)for(int x=x0;x<Math.Min(x1,scanRight);x++){
+                Color origin=bitmap.GetPixel(x,y);
+                double scale=(origin.R/235.0+origin.B/215.0)/2;
+                if(scale<0.5||scale>1.08||!ColorAt(bitmap,x,y,235,19,215,scale))continue;
+                for(int d=3;d<=15;d++){
+                    if(x+d>=x1||y+d>=y1)continue;
+                    if(x+d+1>=x1)continue;
+                    if(!ColorAt(bitmap,x+d,y,19,231,215,scale)||!ColorAt(bitmap,x,y+d,245,221,35,scale))continue;
+                    if(!ColorAt(bitmap,x+1,y,235,19,215,scale)||!ColorAt(bitmap,x+d+1,y,19,231,215,scale)||!ColorAt(bitmap,x+1,y+d,245,221,35,scale))continue;
+                    if(ColorAt(bitmap,x+d,y+d,41,231,83,scale)&&ColorAt(bitmap,x+d+1,y+d,41,231,83,scale))return 0;
+                    if(ColorAt(bitmap,x+d,y+d,41,83,231,scale)&&ColorAt(bitmap,x+d+1,y+d,41,83,231,scale))return 1;
+                }
+            }return -1;
+        }
+    }
+    public static byte[] Capture(string adb,int id,int seconds,string stop){
+        var info=new ProcessStartInfo(adb,"-s emulator-"+(5554+id*2)+" exec-out screencap -p");
+        info.UseShellExecute=false;info.CreateNoWindow=true;info.RedirectStandardOutput=true;info.RedirectStandardError=true;
+        using(var process=new Process()){
+            process.StartInfo=info;process.Start();
+            var output=Task.Run(delegate{
+                using(var memory=new MemoryStream()){
+                    byte[] buffer=new byte[16384];int n;
+                    while((n=process.StandardOutput.BaseStream.Read(buffer,0,buffer.Length))>0){memory.Write(buffer,0,n);if(memory.Length>33554432)throw new IOException("Screen capture exceeded its limit.");}
+                    return memory.ToArray();
+                }
+            });
+            var error=process.StandardError.ReadToEndAsync();var watch=Stopwatch.StartNew();
+            try{
+                while(!process.WaitForExit(100)){if(File.Exists(stop)||watch.Elapsed.TotalSeconds>=seconds)throw new IOException("Screen capture stopped or timed out.");}
+                if(!Task.WaitAll(new Task[]{output,error},1000)||process.ExitCode!=0||error.Result.Trim().Length>0)throw new IOException("Screen capture is unavailable.");
+                return output.Result;
+            }finally{if(!process.HasExited)process.Kill();}
+        }
+    }
+}
+
+'@}}
+    finally{[Threading.Monitor]::Exit($gate)}
+}
+function Get-HybridMarkerPhase {
+    param([int[]]$Bounds)
+    Initialize-HybridStatusNative
+    $adb=Join-Path $Config.LdPlayerInstallPath 'adb.exe'
+    $key="$InstanceIndex|$($script:CurrentEmulatorInstance.ProcessId)"
+    if($script:HybridCapture -and $script:HybridCapture.Key -ceq $key -and ([datetime]::UtcNow-$script:HybridCapture.At).TotalSeconds -lt 1){$capture=$script:HybridCapture.Bytes}
+    else{
+        $capture=[LauncherMarkerPixels]::Capture($adb,$InstanceIndex,[math]::Min(8,$Config.CommandTimeout),[string]$Config.StopFilePath)
+        $script:HybridCapture=@{Key=$key;At=[datetime]::UtcNow;Bytes=$capture}
+    }
+    return [LauncherMarkerPixels]::Inspect($capture,$Bounds[0],$Bounds[1],$Bounds[2],$Bounds[3])
+}
+function Get-DiskBackupRoot {
+    param($Settings=$Config)
+    return (Join-Path ([IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($Settings.ConfigFilePath))) 'backup')
+}
+function Test-NoRootAppCrashLimit {
+    param($Instance)
+    if(-not $Instance -or -not $Instance.AndroidStarted -or $Instance.ProcessId -le 0){return}
+    Sync-AppCrashBoot -BootIdentity $Instance.ProcessId
+    if(-not $script:AppCrashRestartPending){
+        $interval=[math]::Max(1,[int]$Config.GameCheckInterval)
+        if($script:NoRootCrashCheckTicks -gt 0 -and ([Diagnostics.Stopwatch]::GetTimestamp()-$script:NoRootCrashCheckTicks)/[double][Diagnostics.Stopwatch]::Frequency -lt $interval){return}
+        try{
+            $windows=Get-HybridWindowSnapshot
+            if($windows -notmatch 'WINDOW MANAGER WINDOWS|mCurrentFocus=' -or $windows -match 'DUMP TIMEOUT'){throw 'Android window state is unavailable.'}
+            $packages=@(Get-AppCrashPackagesFromWindows -Windows $windows -Packages $Config.GamePackages)
+            Update-AppCrashObservations -Packages $packages
+            $script:NoRootCrashCheckUnavailable=$false
+        }catch [System.Management.Automation.PipelineStoppedException]{throw}
+        catch [OperationCanceledException]{throw}
+        catch{
+            if(-not $script:NoRootCrashCheckUnavailable){Write-FlowStatus 'Android crash-dialog check is unavailable. Keeping the crash counts and retrying on the next check.'}
+            $script:NoRootCrashCheckUnavailable=$true
+        }finally{$script:NoRootCrashCheckTicks=[Diagnostics.Stopwatch]::GetTimestamp()}
+    }
+    if($script:AppCrashRestartPending){
+        $package=[string]$script:AppCrashRestartPending
+        $count=[int]$script:AppCrashCounts[$package]
+        $script:PendingInstanceReplacement=$true
+        Set-EmulatorLiveObservation -AppState Crashed -Package $package
+        Request-NoRootReplacement "$package reached the configured crash limit ($count/$($Config.AppCrashLimit))."
+    }
+}
+function Save-OfflineEmulatorBackup {
+    param($Settings,[int]$Id,$Sources,$Accounts)
+    Assert-AllBackupEmulatorsClosed $Settings
+    $root=Get-DiskBackupRoot $Settings;$null=[IO.Directory]::CreateDirectory($root);Protect-DiskBackupDirectory $root
+    $target=Join-Path $root "$Id";$stage=Join-Path $root ".pending-$Id"
+    foreach($path in @($target,$stage)){Assert-InstanceReplacementDirectory $path $root}
+    if(Get-DiskBackupEntry $Settings $Id){return}
+    if([IO.Directory]::Exists($target)){throw "Backup $Id has partial files outside its staging folder. They were kept for inspection."}
+    $null=[IO.Directory]::CreateDirectory($stage)
+    $progressPath=Join-Path $stage 'progress.json';$progress=@{}
+    if([IO.File]::Exists($progressPath)){
+        $saved=ConvertFrom-Json ([IO.File]::ReadAllText($progressPath))
+        if($saved.Id -ne $Id){throw 'The backup staging folder belongs to another emulator.'}
+        foreach($property in $saved.Files.PSObject.Properties){$progress[$property.Name]=$property.Value}
+    }
+    $locks=New-Object 'System.Collections.Generic.List[object]'
+    try{
+        foreach($name in $Sources.Keys){$locks.Add([IO.File]::Open($Sources[$name],[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read))}
+        $files=@{}
+        foreach($name in @('data.vmdk','sdcard.vmdk','leidian.config','leidian.vbox')){
+            Assert-AllBackupEmulatorsClosed $Settings
+            $source=$Sources[$name];$item=Get-Item -LiteralPath $source;$copy=Join-Path $stage $name;$previous=$progress[$name]
+            $valid=$previous -and $previous.SourceTicks -eq $item.LastWriteTimeUtc.Ticks -and $previous.Length -eq $item.Length -and [IO.File]::Exists($copy)
+            if($valid){$valid=(Get-Item -LiteralPath $copy).Length -eq $previous.Length -and (Get-FileHash -LiteralPath $copy).Hash -ieq $previous.Sha256}
+            if(-not $valid){
+                Write-Host "Backing up LDPlayer $Id : $name"
+                $hash=[LauncherOfflineSession]::CopyVerified($source,$copy,[string]$Settings.StopFilePath,$true)
+                if((Get-Item -LiteralPath $copy).Length -ne $item.Length -or (Get-FileHash -LiteralPath $copy).Hash -ine $hash){throw 'The disk backup copy did not verify. It remains incomplete.'}
+                $previous=@{Length=$item.Length;Sha256=$hash;SourceTicks=$item.LastWriteTimeUtc.Ticks}
+                $progress[$name]=$previous;Write-TemplateStageManifest $progressPath @{Id=$Id;Files=$progress}
+            }
+            $files[$name]=@{Length=$previous.Length;Sha256=$previous.Sha256}
+        }
+        foreach($package in $Settings.GamePackages){
+            $account=$Accounts[$package]
+            if($account.Missing.Count){throw 'Account preflight has not passed. No complete backup was published.'}
+            $folder=Join-Path $stage $package;$null=[IO.Directory]::CreateDirectory($folder)
+            Write-ReplacementTextFile (Join-Path $folder '.ROBLOSECURITY') $account.Session $root
+            Write-TemplateStageManifest (Join-Path $folder 'account.json') @{userId=$account.Profile.userId;username=$account.Profile.username;displayName=$account.Profile.displayName;emulatorId=$Id;package=$package}
+        }
+        Assert-AllBackupEmulatorsClosed $Settings
+        Write-TemplateStageManifest (Join-Path $stage 'manifest.json') @{Version=1;Kind='EmulatorDiskBackup';OwnerId=$Id;SourceId=$Id;SavedUtc=[datetime]::UtcNow.ToString('o');Files=$files;Packages=@($Settings.GamePackages)}
+        [IO.Directory]::Move($stage,$target)
+        $null=Get-DiskBackupEntry $Settings $Id -Verify
+        Write-Host "LDPlayer $Id backup completed and verified."
+    }finally{foreach($handle in $locks){$handle.Dispose()}}
+}
+function Clear-LegacyDiskBackupState {
+    $directory=[IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($Config.ConfigFilePath))
+    $legacy=Join-Path $directory 'app-data'
+    if([IO.Directory]::Exists($legacy)){
+        Assert-InstanceReplacementDirectory $legacy $directory
+        foreach($item in @(Get-ChildItem -LiteralPath $legacy -Recurse -Force)){Assert-InstanceReplacementDirectory $item.FullName $legacy}
+        [IO.Directory]::Delete($legacy,$true)
+    }
+    foreach($folder in @(Get-ChildItem -LiteralPath $Config.RestoreStateDirectory -Directory -ErrorAction SilentlyContinue|Where-Object{$_.Name -match '^offline-read-[a-f0-9]{32}$'})){
+        Assert-InstanceReplacementDirectory $folder.FullName $Config.RestoreStateDirectory
+        foreach($item in @(Get-ChildItem -LiteralPath $folder.FullName -Recurse -Force)){Assert-InstanceReplacementDirectory $item.FullName $Config.RestoreStateDirectory}
+        [IO.Directory]::Delete($folder.FullName,$true)
+    }
+}
+function Protect-DiskBackupDirectory {
+    param([string]$Path)
+    $directory=[IO.DirectoryInfo]::new($Path);$section=[Security.AccessControl.AccessControlSections]::Access
+    if($PSVersionTable.PSVersion.Major -ge 6){$security=[IO.FileSystemAclExtensions]::GetAccessControl($directory,$section)}else{$security=$directory.GetAccessControl($section)}
+    $user=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    $security.SetSecurityDescriptorSddlForm("D:P(A;OICI;FA;;;$user)(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)",$section)
+    if($PSVersionTable.PSVersion.Major -ge 6){[IO.FileSystemAclExtensions]::SetAccessControl($directory,$security)}else{$directory.SetAccessControl($security)}
+}
+function Update-DiskBackupWarningUi {
+    if(-not $Ui -or -not $Ui.Form){return}
+    $path=Join-Path $Ui.Directory 'backup-warning.json'
+    if(-not [IO.File]::Exists($path)){return}
+    try{$notice=ConvertFrom-Json ([IO.File]::ReadAllText($path))}catch{return}
+    Set-LauncherUiProperty $Ui.Backup Text 'Backup blocked: account details are missing. See warning and live log.'
+    Set-LauncherUiProperty $Ui.Backup ForeColor ([Drawing.Color]::FromArgb(255,185,95))
+    if($notice.Token -and $Ui.LastDiskBackupWarning -cne $notice.Token){
+        $Ui.LastDiskBackupWarning=$notice.Token
+        Show-DiskBackupWarning -Message ([string]$notice.Message)
+    }
+}
+function Show-DiskBackupWarning {
+    param([string]$Message)
+    [Windows.Forms.MessageBox]::Show($Ui.Form,$Message,'Backup blocked',[Windows.Forms.MessageBoxButtons]::OK,[Windows.Forms.MessageBoxIcon]::Warning)|Out-Null
+}
+function Set-DiskBackupNotice {
+    param([string[]]$Issues)
+    $directory=[IO.Path]::GetDirectoryName($Config.ConfigFilePath)
+    $notice=@{Token=[guid]::NewGuid().ToString('N');Message=('No new backups were created. Missing or unreadable account data:'+"`r`n`r`n"+($Issues -join "`r`n")+"`r`n`r`nLog in to the affected apps, close the emulators, then start the tool again.");CreatedUtc=[datetime]::UtcNow.ToString('o')}
+    Write-TemplateStageManifest (Join-Path $directory 'backup-warning.json') $notice
+}
+function Get-DiskBackupEntry {
+    param($Settings=$Config,[int]$Id=$InstanceIndex,[switch]$Verify)
+    $root=Get-DiskBackupRoot $Settings;$directory=Join-Path $root "$Id"
+    Assert-InstanceReplacementDirectory $directory $root
+    $path=Join-Path $directory 'manifest.json'
+    if(-not [IO.File]::Exists($path)){return $null}
+    $entry=ConvertFrom-Json ([IO.File]::ReadAllText($path))
+    if($entry.Version -ne 1 -or $entry.Kind -cne 'EmulatorDiskBackup' -or $entry.OwnerId -ne $Id -or $entry.SourceId -lt 0){throw "Backup $Id has invalid ownership metadata."}
+    foreach($name in @('data.vmdk','sdcard.vmdk','leidian.vbox','leidian.config')){
+        $record=$entry.Files.$name;$file=Join-Path $directory $name
+        Assert-InstanceReplacementDirectory $file $root
+        if(-not $record -or $record.Length -le 0 -or $record.Sha256 -notmatch '^[A-Fa-f0-9]{64}$' -or -not [IO.File]::Exists($file)){return $null}
+        $item=Get-Item -LiteralPath $file
+        if($item.Length -ne $record.Length){throw "Backup $Id contains an incomplete $name."}
+        if($Verify -and (Get-FileHash -LiteralPath $file).Hash -ine $record.Sha256){throw "Backup $Id failed $name verification. Its files were preserved."}
+    }
+    return @{Directory=$directory;Manifest=$entry}
+}
+function Assert-AllBackupEmulatorsClosed {
+    param($Settings=$Config)
+    Initialize-OfflineDiskNative
+    [LauncherOfflineSession]::AssertAllClosed()
+    $inventory=Get-BootInventory $Settings
+    foreach($entry in $inventory.Values){if($entry.ProcessId -gt 0 -or $entry.AndroidStarted -or $entry.UiProcessId -gt 0 -or $entry.VmProcessId -gt 0){throw 'An emulator is still running. Backup requires every instance, including excluded IDs and template 0, to be closed.'}}
+}
+function Initialize-OfflineDiskNative {
+    if('LauncherOfflineDisk' -as [type]){return}
+    $gate=[string]::Intern('Launcher.OfflineDisk');[Threading.Monitor]::Enter($gate)
+    try{if(-not ('LauncherOfflineDisk' -as [type])){Add-Type -TypeDefinition @'
+using System;
+using System.IO;
+using System.Text;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+using System.Security.Cryptography;
+using System.Diagnostics;
+
+public sealed class LauncherOfflineDisk : IDisposable {
+    readonly FileStream file;
+    readonly long capacity, grain, directory;
+    readonly int entries;
+    readonly Dictionary<long,byte[]> tables=new Dictionary<long,byte[]>();
+    long fsBase;
+    int blockSize,inodeSize,descSize;
+    uint inodesPerGroup;
+    static ushort U16(byte[] b,int p){return BitConverter.ToUInt16(b,p);}
+    static uint U32(byte[] b,int p){return BitConverter.ToUInt32(b,p);}
+    static long U64(byte[] b,int p){ulong n=BitConverter.ToUInt64(b,p);if(n>Int64.MaxValue)throw new IOException("Disk offset exceeds supported range.");return (long)n;}
+    public LauncherOfflineDisk(string path){
+        file=new FileStream(path,FileMode.Open,FileAccess.Read,FileShare.Read);
+        try {
+            byte[] h=Physical(0,80);
+            if(Encoding.ASCII.GetString(h,0,4)!="KDMV"||(U32(h,8)&0x10000)!=0)throw new IOException("Unsupported VMDK layout.");
+            capacity=checked(U64(h,12)*512);grain=checked(U64(h,20)*512);entries=checked((int)U32(h,44));directory=checked(U64(h,56)*512);
+            if(grain<512||grain>16777216||entries<1||entries>1048576)throw new IOException("Invalid VMDK metadata.");
+            byte[] mbr=Read(0,512);
+            if(U16(mbr,510)!=0xaa55)throw new IOException("The data disk has no supported partition table.");
+            long offset=checked((long)U32(mbr,470)*512);
+            if(mbr[466]==0||offset<=0)throw new IOException("The Android data partition is missing.");
+            byte[] sb=Read(offset+1024,1024);
+            if(U16(sb,56)!=0xef53)throw new IOException("The Android data partition is unsupported.");
+            fsBase=offset;uint shift=U32(sb,24);if(shift>6)throw new IOException("Invalid filesystem block size.");
+            blockSize=1024<<(int)shift;inodesPerGroup=U32(sb,40);inodeSize=U16(sb,88);if(inodeSize==0)inodeSize=128;
+            descSize=(U32(sb,96)&0x80)!=0?Math.Max(32,(int)U16(sb,254)):32;
+            if(inodesPerGroup==0||inodeSize<128||inodeSize>blockSize||descSize>blockSize)throw new IOException("Invalid filesystem metadata.");
+        }catch{file.Dispose();throw;}
+    }
+    byte[] Physical(long offset,int count){
+        if(offset<0||count<0||offset>file.Length-count)throw new IOException("Incomplete disk read.");
+        byte[] b=new byte[count];file.Position=offset;int p=0;
+        while(p<count){int n=file.Read(b,p,count-p);if(n==0)throw new IOException("Incomplete disk read.");p+=n;}return b;
+    }
+    byte[] Read(long offset,int count){
+        if(offset<0||count<0||count>67108864||offset>capacity-count)throw new IOException("Invalid disk read.");
+        byte[] b=new byte[count];int done=0;
+        while(done<count){
+            long number=(offset+done)/grain,within=(offset+done)%grain,gdi=number/entries;byte[] table;
+            if(!tables.TryGetValue(gdi,out table)){
+                uint sector=U32(Physical(directory+gdi*4,4),0);
+                table=sector==0?new byte[entries*4]:Physical((long)sector*512,entries*4);
+                if(tables.Count>=256)tables.Clear();tables[gdi]=table;
+            }
+            uint grainSector=U32(table,(int)(number%entries)*4);int amount=(int)Math.Min(count-done,grain-within);
+            if(grainSector>1)Buffer.BlockCopy(Physical((long)grainSector*512+within,amount),0,b,done,amount);
+            done+=amount;
+        }return b;
+    }
+    byte[] Block(long number){return Read(checked(fsBase+number*blockSize),blockSize);}
+    byte[] Inode(uint number){
+        if(number==0)throw new IOException("Invalid inode.");
+        long group=(number-1)/inodesPerGroup,index=(number-1)%inodesPerGroup;
+        byte[] desc=Read(fsBase+(blockSize==1024?2:1)*(long)blockSize+group*descSize,descSize);
+        long table=U32(desc,8)+(descSize>=64?(long)U32(desc,40)*4294967296L:0);
+        return Read(checked(fsBase+table*blockSize+index*inodeSize),inodeSize);
+    }
+    void Extents(byte[] tree,byte[] result,int budget){
+        if(budget<0||U16(tree,0)!=0xf30a)throw new IOException("Invalid extent tree.");
+        int count=U16(tree,2),depth=U16(tree,6);if(12+count*12>tree.Length)throw new IOException("Invalid extent count.");
+        for(int i=0;i<count;i++){
+            int p=12+i*12;
+            if(depth>0){Extents(Block(U32(tree,p+4)+(long)U16(tree,p+8)*4294967296L),result,budget-1);continue;}
+            long target=(long)U32(tree,p)*blockSize;int length=U16(tree,p+4);
+            if(length>0x8000||target>=result.Length)continue;
+            long physical=U32(tree,p+8)+(long)U16(tree,p+6)*4294967296L;
+            int n=(int)Math.Min((long)length*blockSize,result.Length-target);
+            byte[] bytes=Read(fsBase+physical*blockSize,n);Buffer.BlockCopy(bytes,0,result,(int)target,n);
+        }
+    }
+    long Indirect(long number,long index,int depth){
+        if(number==0)return 0;byte[] b=Block(number);long span=1;for(int i=1;i<depth;i++)span*=blockSize/4;
+        long selected=U32(b,checked((int)(index/span)*4));return depth==1?selected:Indirect(selected,index%span,depth-1);
+    }
+    byte[] Data(uint number){
+        byte[] inode=Inode(number);int mode=U16(inode,0)&0xf000;
+        long size=U32(inode,4)+(mode==0x8000?(long)U32(inode,108)*4294967296L:0);
+        if(size>67108864)throw new IOException("Account file exceeds the bounded read limit.");
+        byte[] result=new byte[(int)size];
+        if(mode==0xa000&&size<=60){Buffer.BlockCopy(inode,40,result,0,(int)size);return result;}
+        if((U32(inode,32)&0x80000)!=0){byte[] tree=new byte[60];Buffer.BlockCopy(inode,40,tree,0,60);Extents(tree,result,5);}
+        else for(long i=0;i*blockSize<size;i++){
+            long block=0,n=i,per=blockSize/4;
+            if(n<12)block=U32(inode,40+(int)n*4);
+            else if((n-=12)<per)block=Indirect(U32(inode,88),n,1);
+            else if((n-=per)<per*per)block=Indirect(U32(inode,92),n,2);
+            else block=Indirect(U32(inode,96),n-per*per,3);
+            if(block!=0)Buffer.BlockCopy(Block(block),0,result,(int)(i*blockSize),(int)Math.Min(blockSize,size-i*blockSize));
+        }return result;
+    }
+    uint Child(uint number,string name){
+        if((U16(Inode(number),0)&0xf000)!=0x4000)throw new FileNotFoundException("An account-data directory is missing.");
+        byte[] b=Data(number);
+        for(int p=0;p+8<=b.Length;){
+            uint ino=U32(b,p);int length=U16(b,p+4),n=b[p+6];
+            if(length<8||p+length>b.Length||n>length-8)throw new IOException("Invalid directory entry.");
+            if(ino!=0&&Encoding.UTF8.GetString(b,p+8,n)==name)return ino;p+=length;
+        }throw new FileNotFoundException("An account-data file is missing.");
+    }
+    byte[] Get(string path,int depth){
+        if(depth>8)throw new IOException("Too many symbolic links.");
+        var parts=new List<string>();foreach(string part in path.Split('/')){if(part==""||part==".")continue;if(part==".."){if(parts.Count>0)parts.RemoveAt(parts.Count-1);}else parts.Add(part);}
+        uint ino=2;var prefix=new List<string>();
+        for(int i=0;i<parts.Count;i++){
+            ino=Child(ino,parts[i]);
+            if((U16(Inode(ino),0)&0xf000)==0xa000){
+                string target=Encoding.UTF8.GetString(Data(ino));
+                if(target.StartsWith("/data/",StringComparison.Ordinal))target=target.Substring(6);
+                else if(!target.StartsWith("/",StringComparison.Ordinal))target=String.Join("/",prefix.ToArray())+"/"+target;
+                for(int j=i+1;j<parts.Count;j++)target+="/"+parts[j];return Get(target,depth+1);
+            }prefix.Add(parts[i]);
+        }return Data(ino);
+    }
+    public byte[] TryRead(string path){try{return Get(path,0);}catch(FileNotFoundException){return null;}}
+    public void Dispose(){file.Dispose();}
+}
+
+public static class LauncherOfflineSession {
+    public static void AssertAllClosed(){
+        foreach(string name in new[]{"dnplayer","ld9boxheadless","ld9BoxSVC"})foreach(Process process in Process.GetProcessesByName(name)){
+            using(process){if(!process.HasExited)throw new IOException("An LDPlayer process is running. No backup may be completed until all emulators are closed.");}
+        }
+    }
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)] delegate int Row(IntPtr p,int n,IntPtr values,IntPtr names);
+    [DllImport("winsqlite3.dll",CallingConvention=CallingConvention.Cdecl,EntryPoint="sqlite3_open_v2")]static extern int Open(IntPtr path,out IntPtr db,int flags,IntPtr vfs);
+    [DllImport("winsqlite3.dll",CallingConvention=CallingConvention.Cdecl,EntryPoint="sqlite3_close")]static extern int Close(IntPtr db);
+    [DllImport("winsqlite3.dll",CallingConvention=CallingConvention.Cdecl,EntryPoint="sqlite3_exec")]static extern int Exec(IntPtr db,[MarshalAs(UnmanagedType.LPStr)]string sql,Row callback,IntPtr p,out IntPtr error);
+    [DllImport("winsqlite3.dll",CallingConvention=CallingConvention.Cdecl,EntryPoint="sqlite3_free")]static extern void Free(IntPtr p);
+    public static string Read(string database){
+        byte[] path=Encoding.UTF8.GetBytes(database+"\0");IntPtr memory=Marshal.AllocHGlobal(path.Length),db=IntPtr.Zero;
+        try{
+            Marshal.Copy(path,0,memory,path.Length);if(Open(memory,out db,1,IntPtr.Zero)!=0)throw new IOException("The offline session database could not be opened.");
+            var found=new List<string>();
+            Row callback=delegate(IntPtr p,int n,IntPtr values,IntPtr names){string hex=Marshal.PtrToStringAnsi(Marshal.ReadIntPtr(values))??"";found.Add(hex);return 0;};
+            IntPtr error;int rc=Exec(db,"PRAGMA query_only=ON; SELECT hex(value) FROM cookies WHERE name='.ROBLOSECURITY' AND host_key IN ('.roblox.com','roblox.com') AND path='/';",callback,IntPtr.Zero,out error);
+            if(error!=IntPtr.Zero)Free(error);if(rc!=0)throw new IOException("The offline session database could not be read.");
+            string cookie="";
+            foreach(string hex in found){
+                if(hex.Length==0)continue;if(hex.Length>65536||hex.Length%2!=0)throw new IOException("Unsupported session value.");
+                byte[] bytes=new byte[hex.Length/2];for(int i=0;i<bytes.Length;i++)bytes[i]=Convert.ToByte(hex.Substring(i*2,2),16);
+                string value=new UTF8Encoding(false,true).GetString(bytes);
+                foreach(char c in value)if(c<=32||c>=127)throw new IOException("Unsupported session value.");
+                if(cookie.Length>0&&cookie!=value)throw new IOException("Conflicting offline session values.");cookie=value;
+            }return cookie;
+        }finally{if(db!=IntPtr.Zero)Close(db);Marshal.FreeHGlobal(memory);}
+    }
+    public static string CopyVerified(string source,string target,string stop,bool requireAllClosed){
+        if(requireAllClosed)AssertAllClosed();
+        using(var input=new FileStream(source,FileMode.Open,FileAccess.Read,FileShare.Read))
+        using(var output=new FileStream(target,FileMode.Create,FileAccess.Write,FileShare.None))
+        using(var sha=SHA256.Create()){
+            byte[] buffer=new byte[1048576];int count;var watch=Stopwatch.StartNew();
+            while((count=input.Read(buffer,0,buffer.Length))>0){
+                if(!String.IsNullOrEmpty(stop)&&File.Exists(stop))throw new OperationCanceledException("Stopped while copying a backup disk.");
+                if(requireAllClosed&&watch.ElapsedMilliseconds>=250){AssertAllClosed();watch.Restart();}
+                output.Write(buffer,0,count);sha.TransformBlock(buffer,0,count,buffer,0);
+            }
+            sha.TransformFinalBlock(new byte[0],0,0);output.Flush(true);if(requireAllClosed)AssertAllClosed();
+            return BitConverter.ToString(sha.Hash).Replace("-","");
+        }
+    }
+}
+
+'@}}
+    finally{[Threading.Monitor]::Exit($gate)}
+}
+function Copy-BackupReplacementDisk {
+    param($Settings,[string]$Source,[string]$Target,[long]$Length,[string]$Hash,[string]$SourceUuid,[string]$TargetUuid)
+    $root=Get-DiskBackupRoot $Settings;$vms=Join-Path $Settings.LdPlayerInstallPath 'vms'
+    Assert-InstanceReplacementDirectory $Source $root
+    Assert-InstanceReplacementDirectory $Target $vms
+    $receiptPath=$Target+'.verified.json'
+    if((Test-ReplacementDiskFile $Target $Length @($SourceUuid,$TargetUuid)) -and [IO.File]::Exists($receiptPath)){
+        $receipt=ConvertFrom-Json ([IO.File]::ReadAllText($receiptPath))
+        $item=Get-Item -LiteralPath $Target
+        if($receipt.SourceHash -ieq $Hash -and $receipt.TargetTicks -eq $item.LastWriteTimeUtc.Ticks){return}
+        if($receipt.SourceHash -ieq $Hash -and (Get-FileHash -LiteralPath $Target).Hash -ieq $receipt.TargetHash){return}
+    }
+    if(-not (Test-ReplacementDiskFile $Source $Length @($SourceUuid))){throw 'The saved replacement disk is missing or has changed. Backup files were preserved.'}
+    $temporary=$Target+'.copy.tmp';Assert-InstanceReplacementDirectory $temporary $vms
+    Initialize-OfflineDiskNative
+    $copied=[LauncherOfflineSession]::CopyVerified($Source,$temporary,[string]$Settings.StopFilePath,$false)
+    if($copied -ine $Hash -or (Get-FileHash -LiteralPath $temporary).Hash -ine $Hash){throw 'Replacement disk contents did not match the saved backup. Installation remains incomplete.'}
+    if([IO.File]::Exists($Target)){[IO.File]::Replace($temporary,$Target,[NullString]::Value)}else{[IO.File]::Move($temporary,$Target)}
+    Write-TemplateStageManifest $receiptPath @{SourceHash=$Hash;TargetHash=$copied;TargetTicks=(Get-Item -LiteralPath $Target).LastWriteTimeUtc.Ticks}
+}
+function Read-OfflineBackupAccounts {
+    param([string]$DataPath,[string[]]$Packages,[string]$TemporaryRoot)
+    Initialize-OfflineDiskNative
+    $disk=[LauncherOfflineDisk]::new($DataPath)
+    $accounts=@{}
+    $stage=Join-Path $TemporaryRoot ('offline-read-'+[guid]::NewGuid().ToString('N'))
+    Assert-InstanceReplacementDirectory $stage $TemporaryRoot
+    $null=[IO.Directory]::CreateDirectory($stage)
+    Protect-DiskBackupDirectory $stage
+    try{
+        foreach($package in $Packages){
+            if($package -notmatch '^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z0-9_]+)+$'){throw 'Invalid offline app package.'}
+            $profile=@{userId=$null;username='';displayName=''};$cookie='';$problem=''
+            try{
+                $prefix='data/'+$package
+                $xml=$null
+                foreach($filename in @('prefs.xml','pref.xml')){
+                    $bytes=$disk.TryRead($prefix+'/shared_prefs/'+$filename)
+                    if($null -ne $bytes){$xml=[Text.UTF8Encoding]::new($false,$true).GetString($bytes);break}
+                }
+                $profile=ConvertFrom-AppDataAccountPreferences $xml
+                $bytes=$disk.TryRead($prefix+'/app_webview/Default/Cookies')
+                if($null -ne $bytes){
+                    $appStage=Join-Path $stage $package;$null=[IO.Directory]::CreateDirectory($appStage)
+                    $database=Join-Path $appStage 'Cookies';[IO.File]::WriteAllBytes($database,$bytes)
+                    foreach($suffix in @('-wal','-journal')){
+                        $journal=$disk.TryRead($prefix+'/app_webview/Default/Cookies'+$suffix)
+                        if($null -ne $journal){[IO.File]::WriteAllBytes(($database+$suffix),$journal)}
+                    }
+                    $cookie=[LauncherOfflineSession]::Read($database)
+                }
+            }catch{$problem='Account files could not be read safely.'}
+            $missing=New-Object 'System.Collections.Generic.List[string]'
+            if(-not $cookie){$missing.Add('.ROBLOSECURITY')}
+            foreach($field in @('userId','username','displayName')){if(-not $profile[$field]){$missing.Add($field)}}
+            if($problem){$missing.Add($problem)}
+            $accounts[$package]=@{Profile=$profile;Session=$cookie;Missing=$missing.ToArray()}
+        }
+        return $accounts
+    }finally{
+        $disk.Dispose()
+        Assert-InstanceReplacementDirectory $stage $TemporaryRoot
+        foreach($item in @(Get-ChildItem -LiteralPath $stage -Force -Recurse)){Assert-InstanceReplacementDirectory $item.FullName $TemporaryRoot}
+        [IO.Directory]::Delete($stage,$true)
+    }
+}
+
+
+function ConvertFrom-AppDataAccountPreferences {
+    param([AllowNull()][string]$Text)
+    $profile=@{userId=$null;username='';displayName=''}
+    if(-not $Text){return $profile}
+    $settings=[Xml.XmlReaderSettings]::new();$settings.DtdProcessing=[Xml.DtdProcessing]::Prohibit;$settings.XmlResolver=$null;$settings.MaxCharactersInDocument=4194304
+    $input=[IO.StringReader]::new($Text);$reader=[Xml.XmlReader]::Create($input,$settings)
+    try{
+        $document=[Xml.XmlDocument]::new();$document.XmlResolver=$null;$document.Load($reader)
+        if($document.DocumentElement.Name -cne 'map'){throw 'Unsupported preference document.'}
+        foreach($pair in @(@('userid_long','userId'),@('username','username'),@('displayName','displayName'))){
+            $nodes=$document.SelectNodes('/map/*[@name="'+$pair[0]+'"]')
+            if($nodes.Count -gt 1){throw 'Ambiguous account metadata.'}
+            if($nodes.Count){$node=$nodes[0];$value=if($node.HasAttribute('value')){$node.GetAttribute('value')}else{$node.InnerText};$profile[$pair[1]]=$value}
+        }
+        $id=0L
+        if([long]::TryParse([string]$profile.userId,[ref]$id) -and $id -gt 0){$profile.userId=$id}else{$profile.userId=$null}
+        foreach($key in @('username','displayName')){if($profile[$key].Length -gt 200 -or $profile[$key] -match '[\x00-\x1f\x7f]'){throw 'Unsupported account metadata.'}}
+        return $profile
+    }finally{$reader.Dispose();$input.Dispose()}
+}
+
+
+
+function Save-AppDataAccountFiles {}
+
+
+function Start-NoRootBaseEmulator {
+    param($InstanceInfo=$null)
+    Assert-PoolSetupTurn
+    if($script:PendingInstanceReplacement){throw (New-PackageCheckRestartError)}
+    if($script:PendingEmulatorRestore){Invoke-PendingEmulatorRestore;$InstanceInfo=$null}
+    if($script:PackageCheckRestartPending){throw (New-PackageCheckRestartError)}
+    $instance=$InstanceInfo
+    if($null -eq $instance){$instance=Get-InstanceInfo -Id $InstanceIndex}
+    if($null -eq $instance){throw "LDPlayer ID $InstanceIndex does not exist."}
+    Enter-EmulatorLoadingSlot
+    $script:RecoveryScope='Startup'
+    if($instance.ProcessId -le 0 -or -not $instance.AndroidStarted){Set-EmulatorLiveObservation -EmulatorState Starting -ResetApps}
+    if(-not $instance.AndroidStarted){$script:RequiredAppsCheckedKey=$null;$script:VpnVerifiedBoot=0;;$script:LoadedAppDataCaptures=@{};;$script:AppDataAdbSerial=$null;;;;}
+    $limit=2;if($Config.InstanceOpenTimeoutLimit){$limit=$Config.InstanceOpenTimeoutLimit}
+    while($true){
+        if(Test-FlowStopRequested){throw [OperationCanceledException]::new('Stopped during emulator startup.')}
+        if($instance.ProcessId -gt 0 -and $instance.AndroidStarted){
+            Set-EmulatorLiveObservation -EmulatorState Running
+            $script:CurrentEmulatorInstance=$instance;$script:AppDataBootIdentity=$instance.ProcessId
+            Request-EmulatorWindowLayout -BootIdentity $instance.ProcessId
+            $script:StartupFailureCount=0;$script:RecoveryScope='Packages'
+            Confirm-RequiredEmulatorApps -BootIdentity $instance.ProcessId
+            $null=Save-LoadedEmulatorAppData -BootIdentity $instance.ProcessId
+            $script:StartupFailureCount=0
+            return
+        }
+        $attempt=1+[int]$script:StartupFailureCount
+        $startupError=$null
+        try{
+            if($instance.ProcessId -le 0){Invoke-SpacedEmulatorLaunch -Relaunch:([bool]$script:RecoveringEmulator)}
+            $deadline=[datetime]::UtcNow.AddSeconds($Config.LdPlayerOpenTimeout)
+            Write-FlowStatus "Waiting up to $($Config.LdPlayerOpenTimeout) seconds for Android (startup $attempt/$limit)..."
+            while([datetime]::UtcNow -lt $deadline){
+                if(Test-FlowStopRequested){throw [OperationCanceledException]::new('Stopped during emulator startup.')}
+                $instance=Get-InstanceInfo -Id $InstanceIndex -TimeoutSeconds (Get-CommandBudget $deadline)
+                if($null -ne $instance -and $instance.ProcessId -gt 0 -and $instance.AndroidStarted){break}
+                Wait-FlowPause ([math]::Max(1,$Config.PollInterval))
+            }
+            if($null -ne $instance -and $instance.ProcessId -gt 0 -and $instance.AndroidStarted){continue}
+            $startupError='Android startup timed out.'
+        }catch [System.Management.Automation.PipelineStoppedException]{throw}
+        catch [OperationCanceledException]{throw}
+        catch{$startupError=$_.Exception.Message}
+        $script:StartupFailureCount=1+[int]$script:StartupFailureCount
+        Write-FlowStatus "Startup failed ($($script:StartupFailureCount)/$limit): $startupError"
+        if($script:StartupFailureCount -ge $limit){Set-EmulatorRestoreRequired -Reason "Emulator startup failed $limit times."}
+        Write-FlowStatus 'Closing and reopening this emulator before the next startup attempt.'
+        $null=Invoke-Ld -Arguments @('quit','--index',"$InstanceIndex")
+        $script:RecoveringEmulator=$true;$script:CurrentEmulatorInstance=$null;$script:VpnVerifiedBoot=0
+        Wait-FlowPause ([math]::Max(1,$Config.InstanceRelaunchDelay))
+        $instance=Get-InstanceInfo -Id $InstanceIndex
+        if($null -eq $instance){throw "LDPlayer ID $InstanceIndex is missing after closing."}
+        
+        if($instance.ProcessId -gt 0){throw 'The emulator has not finished closing. Startup will retry without opening apps.'}
+    }
+}
+function Close-NoRootManagedInstance {
+    $instance=Get-NoRootInstance
+    if(-not $instance){throw 'The emulator inventory is unavailable while closing the maintenance pass.'}
+    $script:NoRootClosingProcesses=@()
+    foreach($processId in @($instance.ProcessId,$instance.UiProcessId,$instance.VmProcessId)|Where-Object{$_ -gt 0}|Sort-Object -Unique){
+        $process=Get-Process -Id $processId -ErrorAction SilentlyContinue
+        if($process){try{$script:NoRootClosingProcesses+=@(@{Id=$processId;StartTicks=$process.StartTime.ToUniversalTime().Ticks})}finally{$process.Dispose()}}
+    }
+    if($InstanceIndex -gt 0){
+        foreach($process in @(Get-ReplacementSourceHostProcesses -Settings $Config -OldId $InstanceIndex)){
+            if($script:NoRootClosingProcesses.Id -notcontains $process.ProcessId){$script:NoRootClosingProcesses+=@(@{Id=$process.ProcessId;StartTicks=$process.StartTicks})}
+        }
+    }
+    if($instance.ProcessId -gt 0 -or $instance.AndroidStarted){
+        $probe=Invoke-NoRootNative @('adb','--index',"$InstanceIndex",'--command','shell echo LAUNCHER_ADB_READY') 2 -IgnoreStop
+        if($probe.Success -and $probe.Output -ceq 'LAUNCHER_ADB_READY'){
+            $packages=@(@($Config.GamePackages)+@($CloudflarePackage)|Where-Object{$_ -match '^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z0-9_]+)+$'}|Select-Object -Unique)
+            $command='shell for p in '+($packages -join ' ')+'; do am force-stop $p; done; sync'
+            $null=Invoke-NoRootNative @('adb','--index',"$InstanceIndex",'--command',$command) 5 -IgnoreStop
+        }
+        $closed=Invoke-NoRootNative @('quit','--index',"$InstanceIndex") 10 -IgnoreStop
+        if(-not $closed.Success){throw 'LDPlayer did not accept the close command. Root settings were kept until it closes.'}
+    }
+    $deadline=[datetime]::UtcNow.AddSeconds([math]::Max(10,$Config.LdPlayerOpenTimeout))
+    do{
+        $instance=Get-NoRootInstance
+        $alive=@($script:NoRootClosingProcesses|Where-Object{Test-RestoreProcessAlive $_.Id $_.StartTicks})
+        if($instance -and $instance.ProcessId -le 0 -and -not $instance.AndroidStarted -and -not $alive.Count){
+            $script:NoRootAdbCheckedBoot=0;$script:NoRootReadyBoot=0
+            $script:RequiredAppsCheckedKey=$null;$script:CurrentEmulatorInstance=$null;$script:AppDataAdbSerial=$null
+            return
+        }
+        Start-Sleep -Milliseconds 250
+    }while([datetime]::UtcNow -lt $deadline)
+    throw 'The emulator or one of its processes is still running. Root settings were not changed while it was open.'
+}
+function Set-NoRootRootMode {
+    param([bool]$Enabled)
+    if($Enabled){throw 'This version does not enable Android root.'}
+    $instance=Get-NoRootInstance
+    if(-not $instance -or $instance.ProcessId -gt 0 -or $instance.AndroidStarted){throw 'Root settings can only change after this emulator is confirmed closed.'}
+    foreach($previous in @($script:NoRootClosingProcesses)){
+        if(Test-RestoreProcessAlive $previous.Id $previous.StartTicks){throw 'An emulator process is still exiting. Its root setting was not changed.'}
+    }
+    $path=Get-NoRootConfigPath
+    $settings=ConvertFrom-Json ([IO.File]::ReadAllText($path))
+    $settings|Add-Member NoteProperty 'basicSettings.rootMode' $Enabled -Force
+    $settings|Add-Member NoteProperty 'basicSettings.autoRun' $false -Force
+    Write-ReplacementTextFile -Path $path -Text ($settings|ConvertTo-Json -Depth 30) -Parent ([IO.Path]::GetDirectoryName($path))
+    if((Get-NoRootRootMode) -ne $Enabled){throw 'The root setting was not saved correctly.'}
+    Write-FlowStatus ('Root is now '+$(if($Enabled){'ON for app-data maintenance only.'}else{'OFF.'}))
+}
+function Confirm-NoRootAdb {
+    param([int]$BootIdentity,[ValidateRange(1,15)][int]$Seconds=15)
+    if($BootIdentity -gt 0 -and $script:NoRootAdbCheckedBoot -eq $BootIdentity){return}
+    Assert-PoolSetupTurn
+    Write-FlowStatus "Checking ADB before package verification (up to $Seconds seconds)..."
+    $watch=[Diagnostics.Stopwatch]::StartNew()
+    while($watch.Elapsed.TotalSeconds -lt $Seconds){
+        if(Test-FlowStopRequested){throw [OperationCanceledException]::new('Stopped during ADB readiness verification.')}
+        $remaining=$Seconds-$watch.Elapsed.TotalSeconds
+        $result=Invoke-NoRootNative @('adb','--index',"$InstanceIndex",'--command','shell echo LAUNCHER_ADB_READY') ([math]::Min(3,$remaining))
+        if($result.Success -and $result.Output -ceq 'LAUNCHER_ADB_READY'){
+            $script:NoRootAdbCheckedBoot=$BootIdentity
+            Write-FlowStatus 'ADB is responding. Continuing to package verification.'
+            return
+        }
+        $remaining=$Seconds-$watch.Elapsed.TotalSeconds
+        if($remaining -gt 0){Start-Sleep -Milliseconds ([int][math]::Min(1000,$remaining*1000))}
+    }
+    Request-NoRootReplacement "ADB did not respond within $Seconds seconds after Android loaded."
+}
+
+function Request-NoRootReplacement {
+    param([string]$Reason)
+    if(Test-FlowStopRequested){throw [OperationCanceledException]::new('Stopped before queuing instance replacement.')}
+    $script:PendingInstanceReplacement=$true
+    $script:PackageCheckRestartPending=$false
+    Write-FlowStatus ($Reason+' Queued instance replacement; no app will be opened.')
+    $failure=[OperationCanceledException]::new($Reason)
+    $failure.Data['PoolNeedsSetup']=$true;$failure.Data['NoRootReplacementQueued']=$true
+    throw $failure
+}
+function Get-NoRootRootMode {
+    param([int]$Id=$InstanceIndex)
+    $settings=ConvertFrom-Json ([IO.File]::ReadAllText((Get-NoRootConfigPath $Id)))
+    return ($settings.'basicSettings.rootMode' -eq $true)
+}
+function Invoke-NoRootNative {
+    param([string[]]$Arguments,[double]$TimeoutSeconds=3,[switch]$IgnoreStop)
+    $info=New-Object Diagnostics.ProcessStartInfo
+    $info.FileName=$Config.LdConsolePath
+    $info.Arguments=($Arguments|ForEach-Object{ConvertTo-NativeArgument $_}) -join ' '
+    $info.UseShellExecute=$false;$info.CreateNoWindow=$true;$info.RedirectStandardOutput=$true;$info.RedirectStandardError=$true
+    $process=New-Object Diagnostics.Process;$process.StartInfo=$info
+    try{
+        $watch=[Diagnostics.Stopwatch]::StartNew()
+        if(-not $process.Start()){return @{Success=$false;Output=''}}
+        $stdout=$process.StandardOutput.ReadToEndAsync();$stderr=$process.StandardError.ReadToEndAsync()
+        while(-not $process.WaitForExit(50)){
+            if(-not $IgnoreStop -and (Test-FlowStopRequested)){throw [OperationCanceledException]::new('Stopped during the ADB check.')}
+            if($watch.Elapsed.TotalSeconds -ge $TimeoutSeconds){return @{Success=$false;Output=''}}
+        }
+        $remaining=[int][math]::Max(0,($TimeoutSeconds-$watch.Elapsed.TotalSeconds)*1000)
+        if(-not [Threading.Tasks.Task]::WaitAll([Threading.Tasks.Task[]]@($stdout,$stderr),$remaining)){return @{Success=$false;Output=''}}
+        return @{Success=($process.ExitCode -eq 0 -and -not $stderr.Result.Trim());Output=$stdout.Result.Trim()}
+    }finally{try{if(-not $process.HasExited){$process.Kill()}}catch{};$process.Dispose()}
+}
+function Get-NoRootInstance {
+    $inventory=Get-BootInventory -Settings $Config
+    if($inventory.ContainsKey([int]$InstanceIndex)){return $inventory[[int]$InstanceIndex]}
+    return $null
+}
+function Get-NoRootConfigPath {
+    param([int]$Id=$InstanceIndex)
+    if($Id -lt 0){throw 'Invalid emulator ID for root settings.'}
+    return (Join-Path $Config.LdPlayerInstallPath "vms\config\leidian$Id.config")
+}
+
 $ErrorActionPreference = 'Stop'
 $CloudflarePackage = 'com.cloudflare.onedotonedotonedotone'
 $UiDumpPath = '/sdcard/launcher-flow.xml'
@@ -72,16 +938,16 @@ function Read-FlowConfig {
         ExcludedLdPlayerIds = ''; LdPlayerInstallPath = 'C:\LDPlayer\LDPlayer9'; LdConsolePath = ''; LogSnapshotLdPlayerId = ''
         GamePackages = ''; GamePackage = 'local.deltalite.a'; LauncherPackage = ''; ServerLink = ''; EmulatorsPerServerLink = '5'
         LdPlayerOpenTimeout = '120'; CloudflareOpenTimeout = '60'
-        CloudflareConnectTimeout = '20'; LauncherOpenTimeout = '60'; GameJoinTimeout = '120'; GameHomeTimeout = '60'; GameReadyLogMarker = ''
+        CloudflareConnectTimeout = '20'; LauncherOpenTimeout = '60'; GameJoinTimeout = '120'; GameHomeTimeout = '60'; AppStateRecoveryTimeout = '10'; GameReadyLogMarker = ''
         CommandTimeout = '30'; PollInterval = '1'; MinCheckDelay = '1'; RetryDelay = '2'
         InstanceLaunchDelay = '5'; InstanceRelaunchDelay = '10'
         MaxLoadingInstances = '5'; InstancesPerRow = '5'; LoadingInstanceThreshold = '10'; MaxLoadingInstancesAboveThreshold = '3'
         MaxLoadingApps = '2'
         AutoRestartHours = '0'; PostSyncDelay = '20'
-        AuthUserAgent = ''
-        OverwriteExistingCookies = '0'; SkipRepairNextStart = '0'
+        
+         SkipRepairNextStart = '0'
         CloudflareTimeoutLimit = '2'; InstanceOpenTimeoutLimit = '2'; GameOpenTimeoutLimit = '2'; AppCrashLimit = '2'
-        PackageCheckFailuresBeforeRestart = '2'; PackageCheckRecoveryCyclesBeforeRestore = '2'; PackageCheckRetryDelay = '10'; CookieAuthenticationInterval = '0'
+        PackageCheckFailuresBeforeRestart = '2'; PackageCheckRecoveryCyclesBeforeRestore = '2'; PackageCheckRetryDelay = '10'
         MaxReplacingInstances = '1'; RestoreBackupFile = ''; RecoveryMode = 'Backup'; RecoveryTemplateId = '0'; ResetInstanceCount = '20'
         MaxInstanceLaunchAttempts = '3'; MaxCloudflareAttempts = '0'
         LauncherRelaunchDelay = '3'; MaxServerLinkAttempts = '0'
@@ -126,9 +992,7 @@ function Read-FlowConfig {
     if ($values.GameReadyLogMarker -and $values.GameReadyLogMarker -notmatch '^[A-Za-z][A-Za-z0-9_]{0,79}$') {
         throw 'GameReadyLogMarker must be a single log word (letters, numbers, underscore), or blank.'
     }
-    if ($values.AuthUserAgent.Length -gt 1024 -or $values.AuthUserAgent -cmatch '[^\x20-\x7e]') {
-        throw 'AuthUserAgent must be a single ASCII header value without line breaks.'
-    }
+    
     $ids = New-Object 'System.Collections.Generic.List[int]'
     foreach ($value in $values.ExcludedLdPlayerIds.Split(',')) {
         if (-not $values.ExcludedLdPlayerIds) { break }
@@ -150,10 +1014,10 @@ function Read-FlowConfig {
     }
     $values.LogSnapshotLdPlayerId=$snapshotId
     $values.LogSnapshotDirectory=Join-Path ([IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($Path))) 'logs'
-    foreach ($key in @('MaxLoadingInstances', 'EmulatorsPerServerLink', 'LdPlayerOpenTimeout', 'CloudflareOpenTimeout', 'CloudflareConnectTimeout', 'LauncherOpenTimeout', 'GameJoinTimeout', 'GameHomeTimeout', 'CommandTimeout', 'PollInterval', 'MinCheckDelay', 'RetryDelay', 'InstanceLaunchDelay', 'InstanceRelaunchDelay', 'PostSyncDelay', 'MaxInstanceLaunchAttempts', 'MaxCloudflareAttempts', 'LauncherRelaunchDelay', 'MaxServerLinkAttempts', 'MonitorGame', 'GameCheckInterval', 'CloudflarePollInterval', 'CloudflareRetryDelay','OverwriteExistingCookies','SkipRepairNextStart','PackageCheckRetryDelay','CookieAuthenticationInterval')) {
+    foreach ($key in @('MaxLoadingInstances', 'EmulatorsPerServerLink', 'LdPlayerOpenTimeout', 'CloudflareOpenTimeout', 'CloudflareConnectTimeout', 'LauncherOpenTimeout', 'GameJoinTimeout', 'GameHomeTimeout', 'AppStateRecoveryTimeout', 'CommandTimeout', 'PollInterval', 'MinCheckDelay', 'RetryDelay', 'InstanceLaunchDelay', 'InstanceRelaunchDelay', 'PostSyncDelay', 'MaxInstanceLaunchAttempts', 'MaxCloudflareAttempts', 'LauncherRelaunchDelay', 'MaxServerLinkAttempts', 'MonitorGame', 'GameCheckInterval', 'CloudflarePollInterval', 'CloudflareRetryDelay','SkipRepairNextStart','PackageCheckRetryDelay')) {
         $number = 0
         $minimum = 1
-        if ($key -in @('RetryDelay', 'InstanceLaunchDelay', 'InstanceRelaunchDelay', 'PostSyncDelay', 'MaxInstanceLaunchAttempts', 'MaxCloudflareAttempts', 'LauncherRelaunchDelay', 'MaxServerLinkAttempts', 'MonitorGame','OverwriteExistingCookies','SkipRepairNextStart','CookieAuthenticationInterval')) { $minimum = 0 }
+        if ($key -in @('RetryDelay', 'InstanceLaunchDelay', 'InstanceRelaunchDelay', 'PostSyncDelay', 'MaxInstanceLaunchAttempts', 'MaxCloudflareAttempts', 'LauncherRelaunchDelay', 'MaxServerLinkAttempts', 'MonitorGame','SkipRepairNextStart')) { $minimum = 0 }
         if (-not [int]::TryParse($values[$key], [ref]$number) -or $number -lt $minimum -or $number -gt 86400) {
             throw "$key must be a whole number from $minimum to 86400."
         }
@@ -171,7 +1035,7 @@ function Read-FlowConfig {
     if (-not [double]::TryParse($values.AutoRestartHours,[Globalization.NumberStyles]::AllowDecimalPoint,[Globalization.CultureInfo]::InvariantCulture,[ref]$restartHours) -or [double]::IsNaN($restartHours) -or [double]::IsInfinity($restartHours) -or $restartHours -lt 0 -or $restartHours -gt 87600) { throw 'AutoRestartHours must be 0 (disabled) or a positive number of hours, such as 6 or 1.5.' }
     $values.AutoRestartHours=$restartHours
     if ($values.MonitorGame -gt 1) { throw 'MonitorGame must be 0 (off) or 1 (on).' }
-    if ($values.OverwriteExistingCookies -gt 1) { throw 'OverwriteExistingCookies must be 0 (off) or 1 (on).' }
+    
     if ($values.SkipRepairNextStart -gt 1) { throw 'SkipRepairNextStart must be 0 (off) or 1 (on).' }
     foreach($key in @('CloudflareTimeoutLimit','InstanceOpenTimeoutLimit','GameOpenTimeoutLimit','AppCrashLimit','MaxReplacingInstances','PackageCheckFailuresBeforeRestart','PackageCheckRecoveryCyclesBeforeRestore')){
         $number=0
@@ -218,13 +1082,10 @@ function Read-FlowConfig {
         if ($links.Contains($link)) { throw 'Duplicate server link. Add a different server link for each group of emulators.' }
         $links.Add($link)
     }
-    if ($links.Count -eq 0) { throw 'Add at least one server link using ServerLink.1=https://...' }
+    
     $values.ServerLinks=$links.ToArray()
-    $values.ServerLink=$links[0]
-    $values.CookieStorePath=Join-Path ([IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($Path))) 'cookies.json'
-    $hash=[Security.Cryptography.SHA256]::Create()
-    try { $digest=[BitConverter]::ToString($hash.ComputeHash([Text.Encoding]::UTF8.GetBytes($values.CookieStorePath.ToLowerInvariant()))).Replace('-','') } finally { $hash.Dispose() }
-    $values.CookieStoreMutexName='Local\CodexCookieStore-'+$digest.Substring(0,24)
+    $values.ServerLink=if($links.Count){$links[0]}else{''}
+    
     $hash=[Security.Cryptography.SHA256]::Create()
     try{$installDigest=[BitConverter]::ToString($hash.ComputeHash([Text.Encoding]::UTF8.GetBytes([IO.Path]::GetFullPath($values.LdPlayerInstallPath).ToLowerInvariant()))).Replace('-','')}finally{$hash.Dispose()}
     $values.RestoreMutexName='Local\CodexJoinerRestore-'+$installDigest.Substring(0,24)
@@ -234,7 +1095,7 @@ function Read-FlowConfig {
 
 function Initialize-LauncherRecoveryStateDirectory {
     param($Settings,[string]$LegacyDirectory='')
-    $configPath=if($Settings.ConfigFilePath){$Settings.ConfigFilePath}else{$Settings.CookieStorePath}
+    $configPath=if($Settings.ConfigFilePath){$Settings.ConfigFilePath}else{$Settings.ConfigFilePath}
     $directory=[IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($configPath))
     if($Settings.RestoreMutexName -notmatch '-([A-Fa-f0-9]{24})$'){throw 'The recovery-state installation identity is unavailable.'}
     $digest=$Matches[1].ToUpperInvariant();$root=Join-Path $directory 'restore';$target=Join-Path $root $digest
@@ -369,11 +1230,11 @@ function Clear-ProcessCheckCache {
 
 function Invoke-Ld {
     param([string[]]$Arguments, [int]$TimeoutSeconds = $Config.CommandTimeout)
+    if($Arguments[0] -eq 'runapp' -and (Get-NoRootRootMode)){throw 'App launches are blocked while root is ON.'}
     $TimeoutSeconds=[math]::Max(10,$TimeoutSeconds)
     if($Arguments[0] -eq 'runapp' -and $Arguments[-1] -ceq $Config.GamePackage){
         Enter-EmulatorLoadingSlot
         Prepare-GameAppDataForOpening -Package $Config.GamePackage
-        Clear-PendingCrashedAppCache -Package $Config.GamePackage
     }
     $timer = [Diagnostics.Stopwatch]::StartNew()
     $isCheck = Test-StatusCheckCommand -Arguments $Arguments
@@ -444,8 +1305,9 @@ function Get-CommandBudget {
 }
 
 function Invoke-Android {
-    param([string]$Command, [int]$TimeoutSeconds = $Config.CommandTimeout)
-    Invoke-Ld -Arguments @('adb', '--index', "$InstanceIndex", '--command', $Command) -TimeoutSeconds $TimeoutSeconds
+    param([string]$Command,[int]$TimeoutSeconds=$Config.CommandTimeout)
+    if($Command -match '^shell\s+(?:am\s+start\b|monkey\b)' -and (Get-NoRootRootMode)){throw 'App launches are blocked while root is ON.'}
+    Invoke-Ld -Arguments @('adb','--index',"$InstanceIndex",'--command',$Command) -TimeoutSeconds $TimeoutSeconds
 }
 
 function Get-InstanceInfo {
@@ -669,7 +1531,7 @@ function Update-BootScheduler {
     foreach ($id in @($Scheduler.Active.Keys)) {
         $active=$Scheduler.Active[$id]
         $request=$requests[$id]
-        if ($AliveIds -notcontains $id -or ($request -and ($request.Token -ne $active.Token -or $request.Phase -in @('Finished','Failed','WaitingForCookie')))) {
+        if ($AliveIds -notcontains $id -or ($request -and ($request.Token -ne $active.Token -or $request.Phase -in @('Finished','Failed','WaitingForData')))) {
             $Scheduler.Active.Remove($id)
         } elseif ($request.Phase -eq 'Waiting' -and [long]$active.ExpiresTicks -le $now.Ticks) {
             $Scheduler.Active.Remove($id)
@@ -747,7 +1609,7 @@ function Update-BootScheduler {
         throw
     }
     $null=$loading.Add($id)
-    Write-Host "LDPlayer $id received a setup slot ($($loading.Count)/$($policy.Limit)). The slot stays occupied until all game apps join, or a login app waits for a missing cookie."
+    Write-Host "LDPlayer $id received a setup slot ($($loading.Count)/$($policy.Limit)). The slot stays occupied until app-data maintenance finishes."
 }
 
 function Request-EmulatorLoadingSlot {
@@ -877,26 +1739,7 @@ function Close-AppsBeforeEmulatorRestart {
     Start-Sleep -Seconds ([math]::Max(1,$Config.LauncherRelaunchDelay))
 }
 
-function Invoke-ScheduledEmulatorRestart {
-    param($InstanceInfo)
-    if (-not $Config.AutoRestartHours -or $null -eq $InstanceInfo -or $InstanceInfo.ProcessId -le 0) { return $false }
-    if ($script:EmulatorUptimeProcessId -ne $InstanceInfo.ProcessId) {
-        $script:EmulatorUptimeProcessId=$InstanceInfo.ProcessId
-        $script:EmulatorUptimeSince=[datetime]::UtcNow
-        try { $script:EmulatorUptimeSince=(Get-Process -Id $InstanceInfo.ProcessId -ErrorAction Stop).StartTime.ToUniversalTime() } catch { }
-    }
-    if (([datetime]::UtcNow-$script:EmulatorUptimeSince).TotalHours -lt $Config.AutoRestartHours) { return $false }
-    if ($Config.CookieStorePath -and -not (Save-LoadedEmulatorAppData -BootIdentity $InstanceInfo.ProcessId -Force)) {
-        Write-FlowStatus 'Scheduled restart is waiting for the initial cookie capture to finish. Retrying at the next game check.'
-        return $false
-    }
-    Write-FlowStatus "Auto restart is due after $($Config.AutoRestartHours) hours. Keeping the emulator open until its restart slot and delay are available..."
-    Invoke-SpacedEmulatorLaunch -Relaunch -RestartRunning
-    Start-SelectedEmulator
-    $script:EmulatorUptimeProcessId=0
-    Clear-ProcessCheckCache
-    return $true
-}
+
 
 function Wait-FlowPause {
     param([int]$Seconds)
@@ -909,10 +1752,10 @@ function Wait-FlowPause {
 
 function Ensure-SessionVpn {
     param([switch]$Force)
-    if(-not $Force -and $script:CookieBootIdentity -gt 0 -and $script:VpnVerifiedBoot -eq $script:CookieBootIdentity){return}
+    if(-not $Force -and $script:AppDataBootIdentity -gt 0 -and $script:VpnVerifiedBoot -eq $script:AppDataBootIdentity){return}
     $script:RecoveryScope='VPN'
     Ensure-CloudflareConnected
-    $script:RecoveryScope='Game';$script:VpnVerifiedBoot=$script:CookieBootIdentity
+    $script:RecoveryScope='Game';$script:VpnVerifiedBoot=$script:AppDataBootIdentity
 }
 
 
@@ -920,58 +1763,14 @@ function Ensure-SessionVpn {
 function Start-SelectedEmulator {
     param($InstanceInfo=$null)
     Assert-PoolSetupTurn
-    if($script:PendingInstanceReplacement){throw (New-PackageCheckRestartError)}
-    if($script:PendingEmulatorRestore){Invoke-PendingEmulatorRestore;$InstanceInfo=$null}
-    if($script:PackageCheckRestartPending){throw (New-PackageCheckRestartError)}
-    $instance=$InstanceInfo
-    if($null -eq $instance){$instance=Get-InstanceInfo -Id $InstanceIndex}
-    if($null -eq $instance){throw "LDPlayer ID $InstanceIndex does not exist."}
     Enter-EmulatorLoadingSlot
-    $script:RecoveryScope='Startup'
-    if($instance.ProcessId -le 0 -or -not $instance.AndroidStarted){Set-EmulatorLiveObservation -EmulatorState Starting -ResetApps}
-    if(-not $instance.AndroidStarted){$script:RequiredAppsCheckedKey=$null;$script:VpnVerifiedBoot=0;$script:LoadedCookieCaptures=@{};$script:LoadedAppDataCaptures=@{};$script:WaitingAppDataCookies=@{};$script:CookieAdbSerial=$null;$script:InitialCookieBoot=0;$script:InitialCookieChecks=@{};$script:CookieAuthenticationCache=@{};$script:CookieSlotPause=$null}
-    $limit=2;if($Config.InstanceOpenTimeoutLimit){$limit=$Config.InstanceOpenTimeoutLimit}
-    while($true){
-        if(Test-FlowStopRequested){throw [OperationCanceledException]::new('Stopped during emulator startup.')}
-        if($instance.ProcessId -gt 0 -and $instance.AndroidStarted){
-            Set-EmulatorLiveObservation -EmulatorState Running
-            $script:CurrentEmulatorInstance=$instance;$script:CookieBootIdentity=$instance.ProcessId
-            Request-EmulatorWindowLayout -BootIdentity $instance.ProcessId
-            $script:StartupFailureCount=0;$script:RecoveryScope='Packages'
-            Confirm-RequiredEmulatorApps -BootIdentity $instance.ProcessId
-            $null=Save-LoadedEmulatorAppData -BootIdentity $instance.ProcessId
-            $script:StartupFailureCount=0
-            return
-        }
-        $attempt=1+[int]$script:StartupFailureCount
-        $startupError=$null
-        try{
-            if($instance.ProcessId -le 0){Invoke-SpacedEmulatorLaunch -Relaunch:([bool]$script:RecoveringEmulator)}
-            $deadline=[datetime]::UtcNow.AddSeconds($Config.LdPlayerOpenTimeout)
-            Write-FlowStatus "Waiting up to $($Config.LdPlayerOpenTimeout) seconds for Android (startup $attempt/$limit)..."
-            while([datetime]::UtcNow -lt $deadline){
-                if(Test-FlowStopRequested){throw [OperationCanceledException]::new('Stopped during emulator startup.')}
-                $instance=Get-InstanceInfo -Id $InstanceIndex -TimeoutSeconds (Get-CommandBudget $deadline)
-                if($null -ne $instance -and $instance.ProcessId -gt 0 -and $instance.AndroidStarted){break}
-                Wait-FlowPause ([math]::Max(1,$Config.PollInterval))
-            }
-            if($null -ne $instance -and $instance.ProcessId -gt 0 -and $instance.AndroidStarted){continue}
-            $startupError='Android startup timed out.'
-        }catch [System.Management.Automation.PipelineStoppedException]{throw}
-        catch [OperationCanceledException]{throw}
-        catch{$startupError=$_.Exception.Message}
-        $script:StartupFailureCount=1+[int]$script:StartupFailureCount
-        Write-FlowStatus "Startup failed ($($script:StartupFailureCount)/$limit): $startupError"
-        if($script:StartupFailureCount -ge $limit){Set-EmulatorRestoreRequired -Reason "Emulator startup failed $limit times."}
-        Write-FlowStatus 'Closing and reopening this emulator before the next startup attempt.'
-        $null=Invoke-Ld -Arguments @('quit','--index',"$InstanceIndex")
-        $script:RecoveringEmulator=$true;$script:CurrentEmulatorInstance=$null;$script:VpnVerifiedBoot=0
-        Wait-FlowPause ([math]::Max(1,$Config.InstanceRelaunchDelay))
-        $instance=Get-InstanceInfo -Id $InstanceIndex
-        if($null -eq $instance){throw "LDPlayer ID $InstanceIndex is missing after closing."}
-        
-        if($instance.ProcessId -gt 0){throw 'The emulator has not finished closing. Startup will retry without opening apps.'}
-    }
+    if($script:PendingEmulatorRestore){Invoke-PendingEmulatorRestore}
+    if($script:PendingInstanceReplacement){Request-NoRootReplacement 'An instance replacement is pending.'}
+    if(-not (Get-DiskBackupEntry $Config $InstanceIndex)){throw 'This emulator has no complete disk backup. Restart the tool to run offline preflight.'}
+    $instance=Get-NoRootInstance
+    if(Get-NoRootRootMode){Close-NoRootManagedInstance;Set-NoRootRootMode -Enabled $false;$instance=Get-NoRootInstance}
+    $script:NoRootMaintenance=$false
+    Start-NoRootBaseEmulator -InstanceInfo $instance
 }
 
 function Initialize-EmulatorWindowLayoutNative {
@@ -1463,145 +2262,13 @@ function Test-CloudflareVpnConnected {
     return $false
 }
 
-function Test-LauncherError273Event {
-    param([string]$Line)
-    if($Line -notmatch '\[(?:F|DF)Log::(?:Network|NetworkClient|RbxTransportRnaExpConnection)\]'){return $false}
-    return ($Line -match '(?i)\b(?:Sending\s+disconnect\s+with\s+reason|Disconnection\s+Notification[.]?\s*Reason)\s*:\s*273\b' -or
-            $Line -match '(?i)\b(?:game joined from|same account launched experience from)\s+(?:a\s+)?(?:another|different)\s+device\b')
-}
 
-function Convert-LauncherEventsToState {
-    param([string]$Events, [string]$ReadyMarker, [ref]$AwaitingJoinResponse)
-    $state = 'Unknown'
-    $stage = ''
-    $connectionPending=$false
-    $waitingForJoinResponse=$false
-    $readyMarkerPattern = if ($ReadyMarker) { '\b'+[regex]::Escape($ReadyMarker)+'\b' }
-    foreach ($line in ($Events -split '\r?\n')) {
-        if ($line -match '\[(?:F|DF)Log::HttpTraceError\]\s+HttpResponse\(') {
-            if ($waitingForJoinResponse -and
-                $line -match '\burl:\s*\{\s*"https://gamejoin\.roblox\.com/v1/join-private-game(?=[?"\s])' -and
-                $line -match '\b(?:message:HttpError:\s*(?:Timedout|InactivityTimeout|SslConnectFail)|status:\s*529)\b') {
-                $state = 'JoinHttpFailed'
-                $waitingForJoinResponse=$false
-            }
-            continue
-        }
-        if ($readyMarkerPattern -and $line -match '\[FLog::CreatorOutput\]' -and $line -match $readyMarkerPattern) {
-            $waitingForJoinResponse=$false
-            if ($state -eq 'JoinHttpFailed' -and $stage -eq 'UGCGame') { $state='InGame' }
-            continue
-        }
-        if ($line -match '\[(?:F|DF)Log::(?:Network|NetworkClient|RbxTransportRnaExpConnection)\]') {
-            if (Test-LauncherError273Event $line) {
-                $state='Disconnected';$waitingForJoinResponse=$false;$connectionPending=$false
-            }
-            elseif ($line -match '\bSending disconnect with reason:\s*(\d+)') {
-                $waitingForJoinResponse=$false
-                if ([int]$Matches[1] -in @(264,268,403,524,600)) { $state = 'Blocked' }
-                else { $state = 'Disconnected' }
-            }
-            elseif ($line -match '(?i)\bFailed to connect to server\b.*\bno response\b') { $state = 'Disconnected' }
-            elseif ($line -match '\bNetworkClient:Create\b') { $state = 'Joining'; $connectionPending=$true; $waitingForJoinResponse=$false }
-            elseif ($line -match '(?i)\bConnection accepted from\b') {
-                $connectionPending=$false
-                $waitingForJoinResponse=$false
-                if ($stage -eq 'UGCGame') { $state='InGame' }
-            }
-            elseif ($line -match '(?i)(Client has been disconnected|Connection lost|ID_CONNECTION_LOST)' -and $state -ne 'Blocked') { $state = 'Disconnected' }
-            elseif ($line -match '(?i)Handshake complete' -and -not $connectionPending -and $stage -eq 'UGCGame' -and $state -ne 'Blocked') { $state = 'InGame' }
-            continue
-        }
-        if ($line -notmatch '\[FLog::SingleSurfaceApp\]') { continue }
-        if ($line -match '\bsetStage:\s*\(stage:([A-Za-z0-9_]+)\)') {
-            $stage = $Matches[1]
-            if ($stage -notin @('InitializedUGCGame','UGCGame')) { $waitingForJoinResponse=$false }
-            switch ($Matches[1]) {
-                'LuaApp' { $state = 'Home' }
-                'UGCGame' { $state = 'InGame'; $connectionPending=$false }
-                'InitializedUGCGame' { $state = 'Joining' }
-                default { $state = 'Loading' }
-            }
-        }
-        elseif ($line -match '\blaunchUGCGame:') { $state = 'Joining'; $waitingForJoinResponse=$true }
-        elseif ($line -match '\b(leaveUGCGame|returnToLuaAppInternal):') { $state = 'Loading'; $waitingForJoinResponse=$false }
-    }
-    if ($null -ne $AwaitingJoinResponse) { $AwaitingJoinResponse.Value=$waitingForJoinResponse }
-    if ($state -eq 'JoinHttpFailed') { return 'Disconnected' }
-    return $state
-}
 
-function Test-LauncherReadyEvents {
-    param([string]$Events, [string]$Marker)
-    $ready=$false
-    $joinId=''
-    foreach ($line in ($Events -split '\r?\n')) {
-        if(Test-LauncherError273Event $line){$ready=$false;$joinId=''}
-        if ($line -match '\[(?:F|DF)Log::(?:Network|NetworkClient|RbxTransportRnaExpConnection)\]' -and
-            $line -match '(?i)(\bNetworkClient:Create\b|\bSending disconnect with reason:|\bFailed to connect to server\b.*\bno response\b|Client has been disconnected|Connection lost|ID_CONNECTION_LOST)') {
-            $ready=$false; $joinId=''
-        }
-        if ($line -match '\[FLog::SingleSurfaceApp\]') {
-            if($line -match '\b(launchUGCGame:|leaveUGCGame:|returnToLuaAppInternal:)'){$ready=$false;$joinId=''}
-            elseif($line -match '\bsetStage:\s*\(stage:([A-Za-z0-9_]+)\)' -and $Matches[1] -ne 'UGCGame'){$ready=$false;$joinId=''}
-        }
-        if ($line -notmatch '\[FLog::CreatorOutput\]') { continue }
-        if ($line -match '\[JoinLoad client ([^\]]+)\]\s+Start\b') {
-            $joinId=$Matches[1]; $ready=$false
-        }
-        if ($line -match ('\b'+[regex]::Escape($Marker)+'\b')) {
-            if ($line -match '\[JoinLoad client ([^\]]+)\]' -and $joinId -and $Matches[1] -ne $joinId) { continue }
-            $ready=$true
-        }
-    }
-    return $ready
-}
 
-function Save-StartupLogSnapshot {
-    if ($Config.LogSnapshotLdPlayerId -lt 0 -or $InstanceIndex -ne $Config.LogSnapshotLdPlayerId -or $script:StartupLogSnapshotDone) { return }
-    
-    $script:StartupLogSnapshotDone=$true
-    try {
-        $name='LDPlayer-'+$InstanceIndex+'-'+[datetime]::Now.ToString('yyyyMMdd-HHmmss-fff')+'-'+[guid]::NewGuid().ToString('N').Substring(0,8)
-        $directory=Join-Path $Config.LogSnapshotDirectory $name
-        $null=New-Item -ItemType Directory -Path $directory -Force
-        $summary=Join-Path $directory 'summary.txt'
-        [IO.File]::WriteAllText($summary,"Startup log snapshot for LDPlayer $InstanceIndex`r`nCaptured: $([datetime]::Now.ToString('o'))`r`nRead only: no apps opened, closed or rejoined by this snapshot.`r`n",[Text.Encoding]::UTF8)
-        Write-FlowStatus 'Saving the configured one-time startup log snapshot before the VPN/game flow...'
-        foreach ($package in $Config.GamePackages) {
-            try {
-                $reply=(Invoke-Android "shell pidof $package").Trim()
-                if ($reply -notmatch '^\d+(?:\s+\d+)*$') {
-                    if ($reply) { throw 'Android did not return valid process IDs; its connection may be unavailable.' }
-                    [IO.File]::AppendAllText($summary,"$package : no running process was available. No log captured.`r`n",[Text.Encoding]::UTF8)
-                    continue
-                }
-                $saved=0
-                foreach ($appProcessId in ($reply -split '\s+')) {
-                    $descriptors=Invoke-Android "shell su -c 'ls -l /proc/$appProcessId/fd'"
-                    $pattern='(?m)^\S+[^\r\n]*?\s(?<fd>\d+)\s+->\s+(?<log>/data/(?:data|user/0)/'+[regex]::Escape($package)+'/files/appData/logs/[^\r\n]*_Player_[^\r\n]*\.log)\s*(?:\(deleted\))?\s*$'
-                    $handle=[regex]::Matches($descriptors,$pattern) | Sort-Object {$_.Groups['log'].Value} -Descending | Select-Object -First 1
-                    if (-not $handle) { continue }
-                    $fd=$handle.Groups['fd'].Value
-                    $raw=Invoke-Android "shell su -c 'cat /proc/$appProcessId/fd/$fd'"
-                    if ($raw -match '(?m)^(?:cat:|su:).*?(?:Permission denied|No such file|not found)') { throw 'The current player log could not be read.' }
-                    $fileName=$package+'-'+$appProcessId+'.log'
-                    [IO.File]::WriteAllText((Join-Path $directory $fileName),$raw,[Text.Encoding]::UTF8)
-                    [IO.File]::AppendAllText($summary,"$package : saved $fileName (live PID $appProcessId, descriptor $fd).`r`n",[Text.Encoding]::UTF8)
-                    $saved++
-                }
-                if ($saved -eq 0) { [IO.File]::AppendAllText($summary,"$package : running, but no readable current Player log handle was found. Check Android root access.`r`n",[Text.Encoding]::UTF8) }
-            }
-            catch [System.Management.Automation.PipelineStoppedException] { throw }
-            catch [OperationCanceledException] { throw }
-            catch { [IO.File]::AppendAllText($summary,"$package : capture failed: $($_.Exception.Message)`r`n",[Text.Encoding]::UTF8) }
-        }
-        Write-FlowStatus "Startup log snapshot saved in $directory . Continuing the normal flow."
-    }
-    catch [System.Management.Automation.PipelineStoppedException] { throw }
-    catch [OperationCanceledException] { throw }
-    catch { Write-FlowStatus 'The one-time log snapshot could not be saved. Continuing the normal flow without retrying the snapshot.' }
-}
+
+
+
+
 
 function Get-AppCrashPackagesFromWindows {
     param([string]$Windows, [string[]]$Packages)
@@ -1726,7 +2393,6 @@ function Update-AppCrashObservations {
         if(-not $script:AppCrashVisible[$package]){
             $script:AppCrashVisible[$package]=$true
             $count=1+[int]$script:AppCrashCounts[$package];$script:AppCrashCounts[$package]=$count
-            Set-CrashedAppCachePending -Package $package
             $Config.GamePackage=$package
             Write-FlowStatus "Android keeps-stopping dialog for ${package}: crash count $count/$limit."
             if($count -ge $limit){$script:AppCrashRestartPending=$package}
@@ -1738,76 +2404,17 @@ function New-AppCrashError {
     param([string]$Package)
     if($script:AppCrashRestartPending){$Package=[string]$script:AppCrashRestartPending}
     Set-EmulatorLiveObservation -AppState Crashed -Package $Package
-    Set-CrashedAppCachePending -Package $Package
     $failure=[InvalidOperationException]::new("Android crash dialog is visible for $Package.")
     $failure.Data['GamePackage']=$Package;$failure.Data['AppCrashDialog']=$true
     if($script:AppCrashRestartPending){$failure.Data['AppCrashRestartRequired']=$true}
     return $failure
 }
 
-function Set-CrashedAppCachePending {
-    param([string]$Package)
-    if($Config.GamePackages -cnotcontains $Package){return}
-    if(-not $script:AppCrashCachePending){$script:AppCrashCachePending=@{}}
-    $script:AppCrashCachePending[$Package]=$true
-}
 
-function Get-CrashedAppCacheScript {
-    param([string]$Package)
-    if($Package -notmatch '^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z0-9_]+)+$' -or $Config.GamePackages -cnotcontains $Package){throw 'Cache cleanup requires a configured game app package.'}
-    return @'
-set -u
-pkg='__PACKAGE__'
-fail() { echo "LAUNCHER_CACHE_FAILED:$1"; exit 0; }
-test "$(id -u)" = 0 || fail ROOT_REQUIRED
-am force-stop "$pkg" || fail APP_STOP_FAILED
-attempt=0
-while pidof "$pkg" >/dev/null 2>&1; do
-  attempt=$((attempt+1)); test "$attempt" -lt 12 || fail APP_STILL_RUNNING
-  sleep 0.25
-done
-for target in "/data/data/$pkg/cache" "/data/data/$pkg/code_cache" "/sdcard/Android/data/$pkg/cache"; do
-  test ! -L "$target" || fail CACHE_IS_SYMLINK
-  if test ! -e "$target"; then continue; fi
-  test -d "$target" || fail CACHE_NOT_DIRECTORY
-  resolved=$(readlink -f "$target") || fail CACHE_PATH_UNAVAILABLE
-  case "$resolved" in
-    "/data/data/$pkg/cache"|"/data/data/$pkg/code_cache"|"/data/user/0/$pkg/cache"|"/data/user/0/$pkg/code_cache"|"/storage/emulated/0/Android/data/$pkg/cache"|"/storage/emulated/legacy/Android/data/$pkg/cache"|"/data/media/0/Android/data/$pkg/cache") ;;
-    *) fail UNSUPPORTED_CACHE_PATH ;;
-  esac
-  find "$resolved" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} + || fail CACHE_DELETE_FAILED
-  remaining=$(find "$resolved" -mindepth 1 -maxdepth 1 -print) || fail CACHE_VERIFY_FAILED
-  test -z "$remaining" || fail CACHE_NOT_EMPTY
-done
-echo "LAUNCHER_CACHE_CLEARED:$pkg"
-'@.Replace('__PACKAGE__',$Package)
-}
 
-function Clear-PendingCrashedAppCache {
-    param([string]$Package=$Config.GamePackage)
-    if(-not $script:AppCrashCachePending -or -not $script:AppCrashCachePending[$Package]){return}
-    $scriptText=Get-CrashedAppCacheScript -Package $Package
-    Assert-PoolSetupTurn;Enter-EmulatorLoadingSlot
-    $Config=$Config.Clone();$Config.GamePackage=$Package
-    Write-FlowStatus "Clearing only $Package cache after its crash, before reopening..."
-    try{
-        $result=Invoke-GameAppDataAdb -Arguments @('shell','su -c sh') -InputText $scriptText -TimeoutSeconds $Config.CommandTimeout
-        if($result -notmatch ('(?m)^LAUNCHER_CACHE_CLEARED:'+ [regex]::Escape($Package)+'\s*$')){
-            $reason='Android did not confirm cache cleanup.'
-            if($result -match '(?m)^LAUNCHER_CACHE_FAILED:([A-Z_]+)\s*$'){$reason='Android cache cleanup failed: '+$Matches[1]+'.'}
-            throw $reason
-        }
-    }catch [System.Management.Automation.PipelineStoppedException]{throw}
-    catch [OperationCanceledException]{throw}
-    catch{
-        $failure=New-GameStatusReadError "Cache cleanup for $Package is pending. The app remains closed for retry. $($_.Exception.Message)"
-        $failure.Data['AppCacheCleanupFailed']=$true;throw $failure
-    }
-    $script:AppCrashCachePending.Remove($Package)
-    if($script:AppCrashVisible){$script:AppCrashVisible.Remove($Package)}
-    Clear-ProcessCheckCache
-    Write-FlowStatus "Cleared $Package cache. Opening the app next; login databases, preferences and saved files were kept."
-}
+
+
+
 
 function Get-VisibleAppCrashPackages {
     param([datetime]$Deadline=[datetime]::UtcNow.AddSeconds($Config.CommandTimeout))
@@ -1839,135 +2446,41 @@ function Get-VisibleAppCrashPackages {
     return $packages
 }
 
-function Test-LauncherStartupConnectionFailure {
-    param([string]$Events)
-    $atHome=$false
-    $joinObserved=$false
-    $homeSince=[datetime]::MinValue
-    $failures=@{}
-    $dateStyle=[Globalization.DateTimeStyles]::AssumeUniversal -bor [Globalization.DateTimeStyles]::AdjustToUniversal
-    $culture=[Globalization.CultureInfo]::InvariantCulture
-    $dateFormat='yyyy-MM-ddTHH:mm:ss.fffZ'
-    foreach ($line in ($Events -split '\r?\n')) {
-        if ($line -match '\[FLog::SingleSurfaceApp\].*\bsetStage:\s*\(stage:([A-Za-z0-9_]+)\)') {
-            $stage=$Matches[1]
-            if ($stage -in @('InitializedUGCGame','UGCGame')) { $joinObserved=$true }
-            $atHome=$false
-            $failures.Clear()
-            
-            
-            if ($stage -eq 'LuaApp' -and -not $joinObserved) {
-                $fields=$line -split ',',3
-                $uptime=0.0
-                $atHome=$fields.Count -ge 3 -and
-                    [double]::TryParse($fields[1],[Globalization.NumberStyles]::Float,$culture,[ref]$uptime) -and
-                    $uptime -ge 0 -and $uptime -le 60 -and
-                    [datetime]::TryParseExact($fields[0],$dateFormat,$culture,$dateStyle,[ref]$homeSince)
-            }
-            continue
-        }
-        if ($line -match '\[FLog::SingleSurfaceApp\].*\b(?:launchUGCGame|leaveUGCGame):' -or
-            $line -match '\[(?:F|DF)Log::Network(?:Client)?\].*\b(?:NetworkClient:Create|Connection accepted from)\b') {
-            $joinObserved=$true
-            $atHome=$false
-        }
-        elseif ($line -match '\[FLog::SingleSurfaceApp\].*\breturnToLuaAppInternal:') {
-            $atHome=$false
-        }
-        if (-not $atHome -or $line -notmatch '\[(?:F|DF)Log::HttpTraceError\]\s+HttpResponse\(') { continue }
-        $endpoint=[regex]::Match($line,'\burl:\s*\{\s*"(?<url>https://[^?"\s]+)(?:\?[^"\r\n]*)?"')
-        if (-not $endpoint.Success) { continue }
-        $service=switch -Regex ($endpoint.Groups['url'].Value) {
-            '^https://apis\.roblox\.com/guac-v2/v1/bundles/app-policy$' { 'Policy'; break }
-            '^https://users\.roblox\.com/v1/users/authenticated/app-launch-info$' { 'Launch'; break }
-            '^https://apis\.roblox\.com/user-heartbeats-api/(?:pulse|action-report)$' { 'Heartbeat'; break }
-        }
-        if (-not $service) { continue }
-        if ($line -match '\bstatus:\s*2\d\d\b') { $failures.Remove($service); continue }
-        if ($line -notmatch '\bmessage:HttpError:\s*(?:Timedout|InactivityTimeout)\b') { continue }
-        $when=[datetime]::MinValue
-        $dateText=($line -split ',',2)[0]
-        if (-not [datetime]::TryParseExact($dateText,$dateFormat,$culture,$dateStyle,[ref]$when)) { continue }
-        if ($when -ge $homeSince -and $when -le $homeSince.AddMinutes(1)) { $failures[$service]=$when }
-    }
-    if (-not $atHome -or $failures.Count -ne 3) { return $false }
-    $times=@($failures.Values | Sort-Object)
-    return (($times[-1]-$times[0]).TotalSeconds -le 30)
-}
+
 
 function Get-LauncherSessionState {
-    param([datetime]$Deadline = [datetime]::UtcNow.AddSeconds($Config.CommandTimeout), [switch]$RequireReady=$true, [switch]$CheckStartupConnection)
-    $null=Get-GameStatusCommandBudget -Deadline $Deadline
-    $crashed=@(Get-VisibleAppCrashPackages -Deadline $Deadline)
-    if($script:AppCrashRestartPending){throw (New-AppCrashError $script:AppCrashRestartPending)}
-    if ($crashed -ccontains $Config.GamePackage) { return (Publish-GameAppObservation 'Crashed') }
-    
-    
-    $pidText = Get-GameAppPids -Package $Config.GamePackage -Deadline $Deadline
-    if (-not $pidText) { return (Publish-GameAppObservation 'Closed') }
-    if ($pidText -notmatch '^\d+$') { return (Publish-GameAppObservation 'Unknown') }
-    $launcherProcessId = $pidText
-    $descriptors = Invoke-GameStatusCommand -Command "shell su -c 'ls -l /proc/$launcherProcessId/fd'" -Description 'find the current game log' -Deadline $Deadline
-    $logPattern = '(?m)^\S+[^\r\n]*?\s(?<fd>\d+)\s+->\s+(?<log>/data/(?:data|user/0)/' + [regex]::Escape($Config.GamePackage) + '/files/appData/logs/[^\r\n]*_Player_[^\r\n]*\.log)\s*(?:\(deleted\))?\s*$'
-    $logs = @([regex]::Matches($descriptors, $logPattern) | Sort-Object { $_.Groups['log'].Value } -Descending)
-    if ($logs.Count -eq 0) { return (Publish-GameAppObservation (Get-LauncherStateWithPresentation -State Unknown -Deadline $Deadline)) }
-    $descriptor = $logs[0].Groups['fd'].Value
-    
-    
-    $readyPatterns='';$readyCategory=''
-    if ($RequireReady -and $Config.GameReadyLogMarker) {
-        $readyPatterns=" -e JoinLoad -e $($Config.GameReadyLogMarker)"
-        $readyCategory=' -e Log::CreatorOutput]'
-    }
-    
-    
-    
-    
-    
-    $logCommand="shell su -c 'grep -ai -e reason: -e Disconnection.Notification -e another.device -e different.device -e no.response -e Client:Create -e accepted.from -e disconnected -e connection.lost -e setStage -e shake.complete -e UGCGame -e returnToLua$readyPatterns /proc/$launcherProcessId/fd/$descriptor | grep -a -e SingleSurfaceApp -e Log::Network] -e Log::NetworkClient] -e Log::RbxTransportRnaExpConnection]$readyCategory | tail -n 100'"
-    $events = Invoke-GameStatusCommand -Command $logCommand -Description 'read the current game log' -Deadline $Deadline
-    $awaitingJoinResponse=$false
-    $state=Convert-LauncherEventsToState -Events $events -ReadyMarker $Config.GameReadyLogMarker -AwaitingJoinResponse ([ref]$awaitingJoinResponse)
-    if ($RequireReady -and $Config.GameReadyLogMarker -and $state -eq 'InGame' -and -not (Test-LauncherReadyEvents -Events $events -Marker $Config.GameReadyLogMarker)) {
-        $state='Joining'
-    }
-    if ($state -eq 'Joining' -and $awaitingJoinResponse) {
-        $httpCommand="shell su -c 'grep -ai gamejoin[.]roblox[.]com/v1/join-private-game /proc/$launcherProcessId/fd/$descriptor | grep -a -e Log::HttpTraceError] | tail -n 10'"
-        try { $httpEvents=Invoke-GameStatusCommand -Command $httpCommand -Description 'check for a private-server join failure' -Deadline $Deadline }
-        catch [InvalidOperationException] {
-            if (-not $_.Exception.Data['GameStatusReadFailed']) { throw }
-            return (Publish-GameAppObservation $state)
-        }
-        if ($httpEvents) {
-            
-            $orderedEvents=(($events+[Environment]::NewLine+$httpEvents) -split '\r?\n' | Sort-Object) -join [Environment]::NewLine
-            if ((Convert-LauncherEventsToState -Events $orderedEvents -ReadyMarker $Config.GameReadyLogMarker) -eq 'Disconnected') { return (Publish-GameAppObservation 'Disconnected') }
-        }
-    }
-    $state=Get-LauncherStateWithPresentation -State $state -Deadline $Deadline
-    if($state -eq 'Minimized'){return (Publish-GameAppObservation $state)}
-    if ($state -eq 'Home' -and $CheckStartupConnection) {
-        if ($null -eq $script:NextStartupConnectionProbe) { $script:NextStartupConnectionProbe=@{} }
-        $lastProbe=$script:NextStartupConnectionProbe[$Config.GamePackage]
-        $now=[datetime]::UtcNow
-        if ($lastProbe.ProcessId -ne $launcherProcessId -or $now -ge $lastProbe.NextCheck) {
-            $script:NextStartupConnectionProbe[$Config.GamePackage]=@{
-                ProcessId=$launcherProcessId
-                NextCheck=$now.AddSeconds([math]::Max(1,$Config.GameCheckInterval))
-            }
-            
-            
-            $startupCommand="shell su -c 'grep -a -e app-policy -e app-launch-info -e user-heartbeats-api -e setStage: -e launchUGCGame: -e NetworkClient:Create -e accepted -e leaveUGCGame: -e returnToLuaAppInternal: /proc/$launcherProcessId/fd/$descriptor | tail -n 40'"
-            try { $startupEvents=Invoke-GameStatusCommand -Command $startupCommand -Description 'check the Home startup connection' -Deadline $Deadline }
-            catch [InvalidOperationException] {
-                if (-not $_.Exception.Data['GameStatusReadFailed']) { throw }
-                return (Publish-GameAppObservation $state)
-            }
-            if (Test-LauncherStartupConnectionFailure -Events $startupEvents) { return (Publish-GameAppObservation 'StartupConnectionFailed') }
-        }
-    }
-    if($RequireReady -and $state -eq 'InGame'){Reset-JoinedAppCrashCount}
-    return (Publish-GameAppObservation $state)
+    param([datetime]$Deadline=[datetime]::UtcNow.AddSeconds($Config.CommandTimeout),[switch]$RequireReady,[switch]$CheckStartupConnection)
+    $windows=Get-HybridWindowSnapshot -Deadline $Deadline
+    $package=$Config.GamePackage
+    $crashes=@(Get-AppCrashPackagesFromWindows $windows $Config.GamePackages)
+    Sync-AppCrashBoot -BootIdentity ([long]$script:CurrentEmulatorInstance.ProcessId)
+    Update-AppCrashObservations -Packages $crashes
+    if($script:AppCrashRestartPending){Test-NoRootAppCrashLimit -Instance $script:CurrentEmulatorInstance}
+    if($crashes -ccontains $package){return (Publish-GameAppObservation 'Crashed')}
+    if((Get-FocusedAndroidAnrOwner -Windows $windows) -ceq $package){return (Publish-GameAppObservation 'NotResponding')}
+    $pidMatch=[regex]::Match($windows,('(?m)^LAUNCHER_PID:'+ [regex]::Escape($package)+':([0-9 ]*)\r?$'))
+    if(-not $pidMatch.Success){return (Publish-GameAppObservation 'Unknown')}
+    $appProcessIds=$pidMatch.Groups[1].Value.Trim()
+    if(-not $appProcessIds){return (Publish-GameAppObservation 'Closed')}
+    $presentation=Convert-AppWindowsToPresentation $windows $package
+    if($presentation.State -in @('Minimized','Background')){return (Publish-GameAppObservation 'Minimized')}
+    if($presentation.State -ne 'Visible'){return (Publish-GameAppObservation 'Unknown')}
+    $presence=Get-HybridPresence -Package $package
+    if($null -eq $script:HybridPresenceSamples){$script:HybridPresenceSamples=@{}}
+    $script:HybridPresenceSamples[$package]=$presence
+    if(-not $presence.Available){return (Publish-GameAppObservation 'Unknown')}
+    if($presence.Type -eq 0){return (Publish-GameAppObservation 'Disconnected')}
+    if($presence.Type -eq 1){return (Publish-GameAppObservation 'Home')}
+    if($presence.Type -ne 2){return (Publish-GameAppObservation 'Unknown')}
+    if(-not $RequireReady -or $script:PoolRole -eq 'Monitor'){return (Publish-GameAppObservation 'InGame')}
+    $bounds=Get-HybridMarkerBounds $windows $package
+    if(-not $bounds -or $bounds[2] -le 0 -or $bounds[3] -le 0){return (Publish-GameAppObservation 'Unknown')}
+    try{$phase=Get-HybridMarkerPhase $bounds}
+    catch [OperationCanceledException]{throw}
+    catch{return (Publish-GameAppObservation 'Unknown')}
+    if($phase -lt 0){return (Publish-GameAppObservation 'Joining')}
+    Reset-JoinedAppCrashCount -Package $package
+    return (Publish-GameAppObservation 'InGame')
 }
 
 function Test-GameConnectionErrorDialog {
@@ -2005,39 +2518,7 @@ function Clear-GameHomeLinkTimer {
     if ($null -ne $script:GameLinkSentAt) { $script:GameLinkSentAt.Remove($Config.GamePackage) }
 }
 
-function Get-LauncherSetupSessionState {
-    param([datetime]$Deadline)
-    $state='Unknown'
-    $readError=$null
-    try { $state=Get-LauncherSessionState -Deadline $Deadline -RequireReady -CheckStartupConnection }
-    catch [InvalidOperationException] {
-        if (-not $_.Exception.Data['GameStatusReadFailed']) { throw }
-        $readError=$_
-        if((Get-LauncherStateWithPresentation -State Unknown -Deadline $Deadline -CachedOnly) -eq 'Minimized'){$state='Minimized';$readError=$null}
-    }
-    if ($state -eq 'InGame') { Clear-GameHomeLinkTimer }
-    $minimizedHome=$state -eq 'Minimized' -and $null -ne $script:GameAppPresentation -and $script:GameAppPresentation.ContainsKey($Config.GamePackage) -and $script:GameAppPresentation[$Config.GamePackage].LogicalState -eq 'Home'
-    $atHome=$state -eq 'Home' -or $minimizedHome
-    if ($atHome -and $null -ne $script:GameLinkSentAt -and $script:GameLinkSentAt.ContainsKey($Config.GamePackage)) {
-        $homeTimeout=60
-        if ($Config.GameHomeTimeout) { $homeTimeout=$Config.GameHomeTimeout }
-        if (([datetime]::UtcNow-$script:GameLinkSentAt[$Config.GamePackage]).TotalSeconds -ge $homeTimeout) {
-            $failure=[TimeoutException]::new("Game app is still on Home $homeTimeout seconds after sending the server link. Restarting the affected app through the normal recovery flow.")
-            $failure.Data['GameHomeTimeout']=$true
-            Register-FlowStageTimeout -Stage Game
-            throw $failure
-        }
-    }
-    if($state -eq 'Minimized'){return $state}
-    if ($state -notin @('InGame','Disconnected','Blocked','Crashed') -and (Test-GameConnectionErrorDialog -Deadline $Deadline)) {
-        throw 'Roblox Connection Error dialog confirmed. Restarting the affected app.'
-    }
-    if ($state -eq 'StartupConnectionFailed') {
-        throw 'Roblox startup requests timed out while the app stayed on Home. Restarting the affected app.'
-    }
-    if ($readError) { throw $readError }
-    return $state
-}
+function Get-LauncherSetupSessionState {param([datetime]$Deadline)return (Get-LauncherSessionState -Deadline $Deadline)}
 
 function Wait-LauncherSessionState {
     param([int]$Seconds)
@@ -2174,41 +2655,7 @@ function Test-EmulatorResponsive {
     catch { Set-EmulatorLiveObservation -EmulatorState Unresponsive;return $false }
 }
 
-function Restart-AfterUnexpectedError {
-    param([switch]$EmulatorOnly)
-    if($script:PendingEmulatorRestore){Invoke-PendingEmulatorRestore;return 'EmulatorReopened'}
-    $instance=Get-InstanceInfo -Id $InstanceIndex
-    Sync-AppCrashBoot -BootIdentity ([long]$instance.ProcessId)
-    $responsive=Test-EmulatorResponsive -InstanceInfo $instance
-    $crashed=@();if($responsive){$crashed=@(Get-VisibleAppCrashPackages)}
-    if($script:AppCrashRestartPending){
-        Assert-PoolSetupTurn;Enter-EmulatorLoadingSlot
-        $package=[string]$script:AppCrashRestartPending;$limit=2;if($Config.AppCrashLimit){$limit=[int]$Config.AppCrashLimit}
-        $Config=$Config.Clone();$Config.GamePackage=$package;$Config.LauncherPackage=$package
-        Write-FlowStatus "$package reached the crash limit ($limit). Closing all user apps before restarting this emulator."
-        if($responsive){Close-AppsBeforeEmulatorRestart}
-        else{Write-FlowStatus 'Android is not responding; app cleanup is unavailable. Closing this emulator.'}
-        $EmulatorOnly=$true
-    }
-    if(-not $EmulatorOnly -and $responsive){
-        if($crashed -ccontains $Config.GamePackage){Dismiss-AndroidAppCrashDialog -Package $Config.GamePackage}
-        Write-FlowStatus "Android is responding. Closing only $($Config.GamePackage); its next turn will reopen and rejoin."
-        $null=Invoke-Ld -Arguments @('killapp','--index',"$InstanceIndex",'--packagename',$Config.GamePackage)
-        Clear-GameHomeLinkTimer;Clear-ProcessCheckCache
-        return 'GameClosed'
-    }
-    Write-FlowStatus 'Restarting this emulator. The full package, cookie, VPN and game flow will run after it loads.'
-    Set-EmulatorLiveObservation -EmulatorState Restarting -ResetApps
-    if($null -ne $instance -and $instance.ProcessId -gt 0){$null=Invoke-Ld -Arguments @('quit','--index',"$InstanceIndex")}
-    Reset-AppCrashTracking
-    $script:CurrentEmulatorInstance=$null;$script:VpnVerifiedBoot=0;$script:RequiredAppsCheckedKey=$null
-    Clear-ProcessCheckCache
-    Wait-FlowPause ([math]::Max(1,$Config.InstanceRelaunchDelay))
-    $script:RecoveringEmulator=$true
-    
-    
-    return 'EmulatorReopened'
-}
+
 
 function Ensure-CloudflareConnected {
     $attempt=0
@@ -2272,97 +2719,13 @@ function Ensure-CloudflareConnected {
     }
 }
 
-function Invoke-EmulatorFlow {
-    param([switch]$DisconnectConfirmed)
-    Enter-EmulatorLoadingSlot
-    Start-SelectedEmulator -InstanceInfo $script:CurrentEmulatorInstance
-    $script:RecoveryScope='Game'
-    if ($Config.CookieStorePath -and -not (Save-LoadedEmulatorAppData -BootIdentity $script:CookieBootIdentity)) {
-        if (-not (Test-EmulatorResponsive)) { throw [TimeoutException]::new('Emulator stopped responding during initial game-data capture.') }
-        throw (New-GameStatusReadError 'Initial game-data save/restore is incomplete. The app remains closed for retry.')
-    }
-    if ($Config.AutoRestartHours -gt 0 -and $Config.GamePackages.Count -le 1) { $null=Invoke-ScheduledEmulatorRestart -InstanceInfo (Get-InstanceInfo -Id $InstanceIndex) }
-    if($Config.GamePackages.Count -eq 1){Complete-InitialCookieChecks -Results @((Get-SetupGameAppData))}
-    if (@(Get-VisibleAppCrashPackages) -ccontains $Config.GamePackage) { throw (New-AppCrashError $Config.GamePackage) }
-    Ensure-SessionVpn
-    Write-FlowStatus "Checking whether $($Config.GamePackage) is running..."
-    if (Test-AppRunning -Package $Config.GamePackage) {
-        Write-FlowStatus 'Game app is running. Reading its current Home/game state...'
-    }
-    else {
-        if ($null -eq (Get-AppUid -Package $Config.GamePackage)) { throw "$($Config.GamePackage) could not be found. Confirm it is installed in this emulator." }
-        Write-FlowStatus "Opening $($Config.GamePackage) and confirming it is on screen..."
-        if (-not $DisconnectConfirmed) {
-            Invoke-Ld -Arguments @('killapp', '--index', "$InstanceIndex", '--packagename', $Config.GamePackage) | Out-Null
-        }
-        Start-Sleep -Seconds $Config.LauncherRelaunchDelay
-        Clear-GameHomeLinkTimer
-        Invoke-Ld -Arguments @('runapp', '--index', "$InstanceIndex", '--packagename', $Config.GamePackage) | Out-Null
 
-    }
-    $session = Wait-LauncherSessionState -Seconds $Config.LauncherOpenTimeout
-    if($session -eq 'Minimized'){
-        Restore-GameAppWindow -Deadline ([datetime]::UtcNow.AddSeconds($Config.LauncherOpenTimeout))
-        $session=Wait-LauncherSessionState -Seconds $Config.LauncherOpenTimeout
-    }
-    if ($session -eq 'Disconnected' -and -not $DisconnectConfirmed) {
-        Write-FlowStatus 'A network disconnect was logged. Checking again before restarting...'
-        Start-Sleep -Seconds $Config.GameCheckInterval
-        $session = Wait-LauncherSessionState -Seconds $Config.LauncherOpenTimeout
-    }
-    if ($session -eq 'Disconnected') { throw 'Game disconnect confirmed; restarting the affected app.' }
-    if ($session -eq 'Blocked') { throw 'Launcher reported an account/access/kick error. Automatic rejoining was stopped.' }
-    if ($session -eq 'InGame') {
-        Write-FlowStatus 'Game app is already in a game. Skipping the server link to preserve the session.'
-        return 'AlreadyInGame'
-    }
-    if ($session -eq 'Joining') {
-        Write-FlowStatus 'Game app is already joining a game. Skipping a duplicate server link.'
-        return 'AlreadyJoining'
-    }
-    if ($session -in @('Unknown','Minimized','Closed')) {
-        throw [TimeoutException]::new('App opening timed out before Home or a game could be confirmed.')
-    }
-    if ($session -ne 'Home') {
-        throw 'Could not distinguish Home from an active game using the current launcher log. No link was sent. Check that LDPlayer root access is enabled.'
-    }
-    Write-FlowStatus 'Game app is on the Roblox app screen, outside a game. Sending the server link...'
-    return (Open-ServerLinkWithRetry)
-}
 
-function ConvertTo-GameCookieValue {
-    param([AllowNull()][string]$Value)
-    if ($null -eq $Value) { return '' }
-    $valueText=$Value.Trim()
-    if ($valueText.StartsWith('.ROBLOSECURITY=')) { $valueText=$valueText.Substring(15) }
-    if ($valueText -and ($valueText.Length -lt 64 -or $valueText -cmatch '[\x00-\x20\x7f-\uffff;]')) {
-        throw 'A cookie entry is not a complete cookie value. Correct cookies.json; values are not printed.'
-    }
-    return $valueText
-}
 
-function Read-GameCookieStore {
-    if (-not (Test-Path -LiteralPath $Config.CookieStorePath -PathType Leaf)) { throw 'cookies.json is missing; waiting for the cookie file.' }
-    try {
-        $json=[IO.File]::ReadAllText($Config.CookieStorePath)
-        if (-not $json.Trim()) { return @{} }
-        $document=ConvertFrom-Json -InputObject $json -ErrorAction Stop
-        if ($null -eq $document -or $document -isnot [pscustomobject]) { throw 'Invalid document' }
-        $entries=@{}
-        foreach ($instance in $document.PSObject.Properties) {
-            if ($instance.Name -notmatch '^\d+$' -or $instance.Value -isnot [pscustomobject]) { throw 'Invalid instance entry' }
-            $apps=@{}
-            foreach ($app in $instance.Value.PSObject.Properties) {
-                if ($app.Name -notmatch '^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z0-9_]+)+$' -or ($null -ne $app.Value -and $app.Value -isnot [string])) { throw 'Invalid package entry' }
-                $apps[$app.Name]=[string]$app.Value
-            }
-            $entries[$instance.Name]=$apps
-        }
-        return $entries
-    } catch { throw 'cookies.json could not be read as an emulator/package cookie map. Fix the file; apps are not changed.' }
-}
 
-function Protect-GameCookieFile {
+
+
+function Protect-AppDataFile {
     param([string]$Path)
     $file=[IO.FileInfo]::new($Path)
     $section=[Security.AccessControl.AccessControlSections]::Access
@@ -2375,1090 +2738,164 @@ function Protect-GameCookieFile {
     else{$file.SetAccessControl($security)}
 }
 
-function Update-GameCookieStore {
-    param([int[]]$InitializeIds=@(),[string]$Package='',[AllowNull()][string]$Cookie=$null,[switch]$Capture,[switch]$Clear,[AllowNull()][string]$ExpectedCookie=$null,[switch]$Replace,[switch]$PreferApp,[switch]$ClearAll,[int]$MoveFromId=-1,[int]$MoveToId=-1)
-    $mutex=New-Object Threading.Mutex $false,$Config.CookieStoreMutexName
-    $held=$false; $temporary=$null
-    try {
-        try { $held=$mutex.WaitOne([math]::Max(1000,$Config.CommandTimeout*1000)) }
-        catch [Threading.AbandonedMutexException] { $held=$true }
-        if (-not $held) { throw 'Cookie file is busy; retrying at the next game check.' }
-        $exists=Test-Path -LiteralPath $Config.CookieStorePath -PathType Leaf
-        $entries=@{}
-        if ($exists) { $entries=Read-GameCookieStore }
-        $changed=-not $exists
-        foreach ($id in $InitializeIds) {
-            $key=[string]$id
-            if (-not $entries.ContainsKey($key)) { $entries[$key]=@{}; $changed=$true }
-            foreach ($app in $Config.GamePackages) {
-                if (-not $entries[$key].ContainsKey($app)) { $entries[$key][$app]=''; $changed=$true }
-            }
-        }
-        if($MoveFromId -ge 0 -or $MoveToId -ge 0){
-            if($MoveFromId -le 0 -or $MoveToId -le $MoveFromId){throw 'Cookie ID migration requires distinct old and newer instance IDs.'}
-            $oldKey=[string]$MoveFromId;$newKey=[string]$MoveToId
-            if($entries.ContainsKey($oldKey)){
-                if(-not $entries.ContainsKey($newKey)){$entries[$newKey]=@{}}
-                foreach($app in $entries[$oldKey].Keys){
-                    $oldValue=[string]$entries[$oldKey][$app];$newValue=[string]$entries[$newKey][$app]
-                    if($oldValue -and $newValue -and $oldValue -cne $newValue){throw 'The new instance ID already has a different saved cookie. Both accounts were preserved; resolve this conflict before retrying.'}
-                    if($oldValue -or -not $entries[$newKey].ContainsKey($app)){$entries[$newKey][$app]=$oldValue}
-                }
-                $entries.Remove($oldKey);$changed=$true
-            }
-        }
-        if($ClearAll){
-            if(Test-LauncherRunning -Directory ([IO.Path]::GetDirectoryName($Config.CookieStorePath))){throw 'Stop the tool before clearing saved cookies.'}
-            foreach($id in @($entries.Keys)){
-                foreach($app in @($entries[$id].Keys)){
-                    if($entries[$id][$app] -cne ''){$entries[$id][$app]='';$changed=$true}
-                }
-            }
-        }
-        if ($Package) {
-            $key=[string]$InstanceIndex
-            if (-not $entries.ContainsKey($key)) { $entries[$key]=@{}; $changed=$true }
-            if (-not $entries[$key].ContainsKey($Package)) { $entries[$key][$Package]=''; $changed=$true }
-            $current=''
-            if (-not $Replace -and -not $PreferApp) {$current=ConvertTo-GameCookieValue $entries[$key][$Package]}
-            if ($Capture -and -not $current) { $entries[$key][$Package]=$Cookie; $changed=$true }
-            if ($Clear -and $current -ceq $ExpectedCookie) { $entries[$key][$Package]=''; $changed=$true }
-            if ($PreferApp -and $entries[$key][$Package] -cne $Cookie) {$entries[$key][$Package]=$Cookie;$changed=$true}
-            if ($Replace) {
-                if (Test-LauncherRunning -Directory ([IO.Path]::GetDirectoryName($Config.CookieStorePath))) {throw 'Stop the tool before editing a saved cookie.'}
-                $entries[$key][$Package]=$Cookie; $changed=$true
-            }
-        }
-        if ($changed) {
-            $ordered=[ordered]@{}
-            foreach ($key in @($entries.Keys | Sort-Object {[int]$_})) {
-                $ordered[$key]=[ordered]@{}
-                foreach ($app in @($entries[$key].Keys | Sort-Object)) { $ordered[$key][$app]=$entries[$key][$app] }
-            }
-            $temporary=$Config.CookieStorePath+'.'+[guid]::NewGuid().ToString('N')+'.tmp'
-            [IO.File]::WriteAllText($temporary,'')
-            Protect-GameCookieFile -Path $temporary
-            $bytes=[Text.UTF8Encoding]::new($false).GetBytes(($ordered | ConvertTo-Json -Depth 5)+"`r`n")
-            $stream=[IO.File]::Open($temporary,[IO.FileMode]::Open,[IO.FileAccess]::Write,[IO.FileShare]::None)
-            try { $stream.Write($bytes,0,$bytes.Length); $stream.Flush($true) } finally { $stream.Dispose() }
-            if ($exists) {
-                Protect-GameCookieFile -Path $Config.CookieStorePath
-                [IO.File]::Replace($temporary,$Config.CookieStorePath,[NullString]::Value)
-            } else { [IO.File]::Move($temporary,$Config.CookieStorePath) }
-            $temporary=$null
-            Protect-GameCookieFile -Path $Config.CookieStorePath
-        }
-        return $entries
-    }
-    finally {
-        if ($temporary -and (Test-Path -LiteralPath $temporary)) { Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue }
-        if ($held) { $mutex.ReleaseMutex() }
-        $mutex.Dispose()
-    }
-}
 
-function Get-GameAppDataRoot {
-    param($Settings=$Config)
-    $base=if($Settings.ConfigFilePath){[IO.Path]::GetDirectoryName($Settings.ConfigFilePath)}else{[IO.Path]::GetDirectoryName($Settings.CookieStorePath)}
-    if(-not $base){throw 'The app-data storage folder is unavailable.'}
-    return (Join-Path $base 'app-data')
-}
 
-function Get-GameAppDataPaths {
-    param([int]$Id=$InstanceIndex,[string]$Package=$Config.GamePackage,$Settings=$Config)
-    if($Id -lt 0 -or $Package -notmatch '^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z0-9_]+)+$'){throw 'Invalid app-data identity.'}
-    $root=Get-GameAppDataRoot $Settings;$directory=Join-Path (Join-Path $root "$Id") $Package
-    Assert-InstanceReplacementDirectory $directory $root
-    return @{Root=$root;Directory=$directory;Manifest=(Join-Path $directory 'manifest.json');Cookie=(Join-Path $directory '.ROBLOSECURITY')}
-}
+function Get-GameAppDataRoot {param($Settings=$Config)return (Get-DiskBackupRoot $Settings)}
+
+
 
 function Initialize-GameAppDataStore {
-    $root=Get-GameAppDataRoot
-    $null=[IO.Directory]::CreateDirectory($root)
-    Assert-InstanceReplacementDirectory (Join-Path $root '0') ([IO.Path]::GetDirectoryName($root))
-    $directory=[IO.DirectoryInfo]::new($root);$section=[Security.AccessControl.AccessControlSections]::Access
-    if($PSVersionTable.PSVersion.Major -ge 6){$security=[IO.FileSystemAclExtensions]::GetAccessControl($directory,$section)}else{$security=$directory.GetAccessControl($section)}
-    $user=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value
-    $security.SetSecurityDescriptorSddlForm("D:P(A;OICI;FA;;;$user)(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)",$section)
-    if($PSVersionTable.PSVersion.Major -ge 6){[IO.FileSystemAclExtensions]::SetAccessControl($directory,$security)}else{$directory.SetAccessControl($security)}
-    Write-Host 'Game-data storage ready: app-data (one private snapshot per emulator ID and app package). Cookie validation is disabled.'
-}
-
-function Invoke-GameAppDataAdb {
-    param([string[]]$Arguments,[string]$InputText='',[int]$TimeoutSeconds=0)
-    if(-not $script:CookieAdbSerial){
-        $serial=(Invoke-Ld -Arguments @('adb','--index',"$InstanceIndex",'--command','get-serialno')).Trim()
-        if($serial -notmatch '^(emulator-\d+|(?:127\.0\.0\.1|localhost):\d+)$'){throw 'The emulator ADB identity is unavailable for game data.'}
-        $script:CookieAdbSerial=$serial
-    }
-    $info=New-Object Diagnostics.ProcessStartInfo
-    $info.FileName=Join-Path $Config.LdPlayerInstallPath 'adb.exe'
-    $info.Arguments=(@('-s',$script:CookieAdbSerial)+$Arguments|ForEach-Object{ConvertTo-NativeArgument $_}) -join ' '
-    $info.UseShellExecute=$false;$info.CreateNoWindow=$true
-    $info.RedirectStandardInput=$true;$info.RedirectStandardOutput=$true;$info.RedirectStandardError=$true
-    $process=New-Object Diagnostics.Process;$process.StartInfo=$info
-    try{
-        $null=$process.Start();$output=$process.StandardOutput.ReadToEndAsync();$errors=$process.StandardError.ReadToEndAsync()
-        if($InputText.Length){
-            $write=$process.StandardInput.WriteAsync(($InputText -replace "`r`n","`n").TrimEnd([char[]]"`r`n")+"`n")
-            if(-not $write.Wait(10000)){throw 'Game-data input timed out.'}
-        }
-        $process.StandardInput.Close()
-        $watch=[Diagnostics.Stopwatch]::StartNew();$timeout=if($TimeoutSeconds -gt 0){[math]::Max(10,$TimeoutSeconds)}else{[math]::Max(600,$Config.CommandTimeout)}
-        while(-not $process.WaitForExit(500)){
-            if(Test-FlowStopRequested){throw [OperationCanceledException]::new('Stopped during game-data transfer; the saved snapshot is preserved.')}
-            if($watch.Elapsed.TotalSeconds -ge $timeout){throw 'Game-data transfer timed out. The previous snapshot is preserved.'}
-        }
-        if(-not [Threading.Tasks.Task]::WaitAll([Threading.Tasks.Task[]]@($output,$errors),2000) -or $process.ExitCode -ne 0){throw 'Game-data transfer did not complete. Saved snapshots were preserved.'}
-        return $output.Result.Trim()
-    }finally{try{if(-not $process.HasExited){$process.Kill()}}catch{};$process.Dispose()}
-}
-
-function Read-GameAppDataManifest {
-    param($Paths)
-    if(-not [IO.File]::Exists($Paths.Manifest)){return $null}
-    $entry=ConvertFrom-Json ([IO.File]::ReadAllText($Paths.Manifest))
-    if($entry.Version -ne 1 -or $entry.Package -cne [IO.Path]::GetFileName($Paths.Directory) -or $entry.Archive -notmatch '^snapshot-[a-f0-9]{32}[.]tar$' -or $entry.Sha256 -notmatch '^[A-Fa-f0-9]{64}$' -or $entry.Length -le 0){throw 'The saved game-data manifest is invalid. No app data was changed.'}
-    $archive=Join-Path $Paths.Directory $entry.Archive;Assert-InstanceReplacementDirectory $archive $Paths.Root
-    if(-not [IO.File]::Exists($archive) -or ([IO.FileInfo]$archive).Length -ne $entry.Length){throw 'The saved game-data archive is missing or incomplete. No app data was changed.'}
-    return $entry
-}
-
-function Initialize-GameAppCookieArchiveNative {
-    if('LauncherGameCookieTar' -as [type]){return}
-    $gate=[string]::Intern('Launcher.GameCookieTar');[Threading.Monitor]::Enter($gate)
-    try{
-    if('LauncherGameCookieTar' -as [type]){return}
-    Add-Type -TypeDefinition @'
-using System;
-using System.IO;
-using System.Text;
-using System.Collections.Generic;
-public static class LauncherGameCookieTar {
-    static void Exact(Stream s, byte[] b) { int n=0,r; while(n<b.Length) {r=s.Read(b,n,b.Length-n);if(r==0)throw new IOException("Incomplete snapshot header.");n+=r;} }
-    static string Text(byte[] b,int o,int n) {int e=o;while(e<o+n && b[e]!=0)e++;return Encoding.UTF8.GetString(b,o,e-o);}
-    static long Number(byte[] b,int o,int n) {
-        long v=0;checked {if((b[o]&128)!=0) {if((b[o]&64)!=0)throw new IOException("Negative snapshot size.");v=b[o]&127;for(int i=1;i<n;i++)v=v*256+b[o+i];}
-        else {string t=Text(b,o,n).Trim();foreach(char c in t){if(c<'0'||c>'7')throw new IOException("Invalid snapshot size.");v=v*8+c-'0';}}} return v;
-    }
-    static void Copy(Stream src,Stream dst,long n,string stop,byte[] b) {
-        while(n>0){if(!String.IsNullOrEmpty(stop)&&File.Exists(stop))throw new OperationCanceledException("Stopped during saved-cookie update.");int r=src.Read(b,0,(int)Math.Min(n,b.Length));if(r==0)throw new IOException("Incomplete snapshot contents.");dst.Write(b,0,r);n-=r;}
-    }
-    static Dictionary<string,string> Pax(byte[] b) {
-        var d=new Dictionary<string,string>();int p=0;while(p<b.Length){int space=Array.IndexOf(b,(byte)32,p);if(space<0)throw new IOException("Invalid snapshot metadata.");int n;if(!Int32.TryParse(Encoding.ASCII.GetString(b,p,space-p),out n)||n<=space-p+2||n>b.Length-p)throw new IOException("Invalid snapshot metadata.");string t=Encoding.UTF8.GetString(b,space+1,p+n-space-2);int eq=t.IndexOf('=');if(eq>0)d[t.Substring(0,eq)]=t.Substring(eq+1);p+=n;}return d;
-    }
-    public static bool Extract(string input,string package,string stage,string stop) {return Walk(input,null,package,stage,null,stop);}
-    public static void Rewrite(string input,string output,string package,string database,string stop) {if(!Walk(input,output,package,null,database,stop))throw new IOException("Snapshot cookie database is missing.");}
-    static bool Walk(string input,string output,string package,string stage,string database,string stop) {
-        string cookie="data/data/"+package+"/app_webview/Default/Cookies";
-        bool found=false;var seen=new HashSet<string>();var pending=new MemoryStream();string pathOverride=null;long? sizeOverride=null;byte[] buffer=new byte[1048576];
-        using(var src=new FileStream(input,FileMode.Open,FileAccess.Read,FileShare.Read))
-        using(var dst=output==null?null:new FileStream(output,FileMode.CreateNew,FileAccess.Write,FileShare.None)) {
-            while(src.Position<src.Length) {
-                if(!String.IsNullOrEmpty(stop)&&File.Exists(stop))throw new OperationCanceledException("Stopped during saved-cookie update.");
-                byte[] h=new byte[512];Exact(src,h);bool zero=true;foreach(byte b in h)if(b!=0){zero=false;break;}
-                if(zero){if(pending.Length!=0)throw new IOException("Unfinished snapshot metadata.");byte[] tail=new byte[1048576];int r;while((r=src.Read(tail,0,tail.Length))>0)for(int i=0;i<r;i++)if(tail[i]!=0)throw new IOException("Unexpected data after snapshot end.");if(dst!=null)dst.Write(new byte[1024],0,1024);return found;}
-                long sum=0;for(int i=0;i<512;i++)sum+=(i>=148&&i<156)?32:h[i];if(sum!=Number(h,148,8))throw new IOException("Snapshot header failed verification.");
-                string name=Text(h,0,100),prefix=Text(h,345,155);if(prefix.Length>0&&Text(h,257,6).StartsWith("ustar"))name=prefix+"/"+name;
-                long size=Number(h,124,12);char type=(char)h[156];
-                if(type=='x'||type=='L'||type=='K'||type=='g'){
-                    if(size>1048576||pending.Length>4194304)throw new IOException("Oversized snapshot metadata.");
-                    byte[] data=new byte[(int)size];Exact(src,data);int padding=(int)((512-size%512)%512);byte[] pad=new byte[padding];Exact(src,pad);
-                    if(type=='g'){var global=Pax(data);if(global.ContainsKey("path")||global.ContainsKey("size"))throw new IOException("Unsupported global snapshot path/size metadata.");if(dst!=null){dst.Write(h,0,512);dst.Write(data,0,data.Length);dst.Write(pad,0,pad.Length);}continue;}
-                    pending.Write(h,0,512);pending.Write(data,0,data.Length);pending.Write(pad,0,pad.Length);
-                    if(type=='L')pathOverride=Encoding.UTF8.GetString(data).TrimEnd('\0','\n');
-                    if(type=='x'){var meta=Pax(data);if(meta.ContainsKey("path"))pathOverride=meta["path"];if(meta.ContainsKey("size")){long s;if(!Int64.TryParse(meta["size"],out s)||s<0)throw new IOException("Invalid snapshot metadata size.");sizeOverride=s;}}
-                    continue;
-                }
-                if(pathOverride!=null)name=pathOverride;
-                long actual=sizeOverride??size;long padded=checked(actual+(512-actual%512)%512);if(padded>src.Length-src.Position)throw new IOException("Incomplete snapshot contents.");
-                while(name.StartsWith("./"))name=name.Substring(2);
-                bool target=name==cookie||name==cookie+"-wal"||name==cookie+"-shm";
-                if(target){if(type!='0'&&type!='\0')throw new IOException("Snapshot cookie database is not a regular file.");if(!seen.Add(name))throw new IOException("Duplicate snapshot cookie database entry.");if(sizeOverride.HasValue)throw new IOException("Unsupported cookie database size metadata.");}
-                if(stage!=null&&target&&name!=cookie+"-shm"){
-                    if(actual>268435456)throw new IOException("Snapshot cookie database exceeds its supported size.");
-                    using(var file=new FileStream(Path.Combine(stage,name==cookie?"Cookies":"Cookies-wal"),FileMode.CreateNew))Copy(src,file,actual,stop,buffer);
-                    src.Seek(padded-actual,SeekOrigin.Current);
-                }else if(dst!=null&&target){
-                    if(name==cookie){
-                        using(var db=new FileStream(database,FileMode.Open,FileAccess.Read,FileShare.Read)){
-                            string oct=Convert.ToString(db.Length,8);if(oct.Length>11)throw new IOException("Cookie database is too large.");Array.Clear(h,124,12);Encoding.ASCII.GetBytes(oct.PadLeft(11,'0')).CopyTo(h,124);
-                            for(int i=148;i<156;i++)h[i]=32;sum=0;foreach(byte b in h)sum+=b;Encoding.ASCII.GetBytes(Convert.ToString(sum,8).PadLeft(6,'0')).CopyTo(h,148);h[154]=0;h[155]=32;
-                            pending.Position=0;pending.CopyTo(dst);dst.Write(h,0,512);Copy(db,dst,db.Length,stop,buffer);int padding=(int)((512-db.Length%512)%512);dst.Write(new byte[padding],0,padding);
-                        }
-                    }
-                    src.Seek(padded,SeekOrigin.Current);
-                }else if(dst!=null){pending.Position=0;pending.CopyTo(dst);dst.Write(h,0,512);Copy(src,dst,padded,stop,buffer);}else src.Seek(padded,SeekOrigin.Current);
-                if(name==cookie)found=true;pending.SetLength(0);pending.Position=0;pathOverride=null;sizeOverride=null;
-            }
-            throw new IOException("Snapshot end marker is missing.");
+    if(@(Get-PendingInstanceReplacements $Config).Count){Write-Host 'An instance replacement is pending. Resuming its saved backup transaction before checking for new backups.';return}
+    $inventory=Get-BootInventory $Config
+    $ids=@($inventory.Keys|Where-Object{[int]$_ -gt 0 -and $Config.ExcludedLdPlayerIds -notcontains [int]$_}|Sort-Object {[int]$_})
+    $missing=@($ids|Where-Object{-not (Get-DiskBackupEntry $Config ([int]$_))})
+    if(-not $missing.Count){Write-Host 'Verified emulator backups are ready. Root stays OFF.';return}
+    Write-Host 'New backups are needed. Closing all instances before offline account validation...'
+    foreach($id in @($inventory.Keys|Sort-Object {[int]$_})){
+        if(Test-FlowStopRequested){throw [OperationCanceledException]::new('Stopped before closing the next emulator for backup.')}
+        $InstanceIndex=[int]$id
+        $entry=$inventory[$id]
+        if($entry.ProcessId -gt 0 -or $entry.AndroidStarted -or $entry.UiProcessId -gt 0 -or $entry.VmProcessId -gt 0){
+            try{Close-NoRootManagedInstance}catch{Write-Host "LDPlayer $id did not close cleanly. Final force close will check its remaining processes."}
         }
     }
-}
-'@
-    }finally{[Threading.Monitor]::Exit($gate)}
-}
-
-function Read-SavedGameAppCookie {
-    param($Paths)
-    if(-not [IO.File]::Exists($Paths.Cookie)){return ''}
-    Assert-InstanceReplacementDirectory $Paths.Cookie $Paths.Root
-    $value=[IO.File]::ReadAllText($Paths.Cookie).Trim()
-    if($value.Length -gt 32768 -or $value -cmatch '[\x00-\x20\x7f-\uffff]'){throw 'The saved app-data cookie value is invalid. Its contents were withheld.'}
-    return $value
-}
-
-function Write-SavedGameAppCookie {
-    param($Paths,[string]$Value)
-    if(-not $Value -or $Value.Length -gt 32768 -or $Value -cmatch '[\x00-\x20\x7f-\uffff]'){throw 'The app-data cookie value is unavailable or invalid. Its contents were withheld.'}
-    $temp=Join-Path $Paths.Directory ('.cookie-'+[guid]::NewGuid().ToString('N')+'.tmp')
-    try{
-        [IO.File]::WriteAllText($temp,$Value,[Text.UTF8Encoding]::new($false));Protect-GameCookieFile $temp
-        if([IO.File]::Exists($Paths.Cookie)){[IO.File]::Replace($temp,$Paths.Cookie,[NullString]::Value)}else{[IO.File]::Move($temp,$Paths.Cookie)}
-        Protect-GameCookieFile $Paths.Cookie
-        if((Read-SavedGameAppCookie $Paths) -cne $Value){throw 'The local app-data cookie value could not be verified.'}
-    }finally{if([IO.File]::Exists($temp)){[IO.File]::Delete($temp)}}
-}
-
-function Read-GameAppCookieValue {
-    param([string]$Package=$Config.GamePackage,[string]$Database='')
-    if($Package -notmatch '^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z0-9_]+)+$'){throw 'Invalid cookie package.'}
-    if(-not $Database){$Database='/data/data/'+$Package+'/app_webview/Default/Cookies'}
-    if($Database -notmatch '^/data/(?:data/[A-Za-z0-9_.]+/app_webview/Default/Cookies|local/tmp/launcher-cookie-[a-f0-9]{32}/Cookies)$'){throw 'Invalid cookie database path.'}
-    $sql=".bail on`n.timeout 5000`nPRAGMA query_only=ON;`nSELECT 'COOKIE|'||hex(value)||'|'||length(encrypted_value) FROM cookies WHERE name='.ROBLOSECURITY' AND host_key IN ('.roblox.com','roblox.com') AND path='/';"
-    try{
-        $reply=Invoke-GameCookieAdb -Command ("su -c 'if test -f $Database; then sqlite3 $Database; else echo LAUNCHER_COOKIE_EMPTY; fi'") -InputText $sql
-        return (ConvertFrom-GameAppCookieResponse $reply)
-    }catch [System.Management.Automation.PipelineStoppedException]{throw}
-    catch [OperationCanceledException]{throw}
-    catch{throw (New-GameStatusReadError 'The app-data cookie value could not be read safely. Saved data was preserved; diagnostic contents were withheld.')}
-}
-
-function ConvertFrom-GameAppCookieResponse {
-    param([string]$Reply)
-    if($Reply -ceq 'LAUNCHER_COOKIE_EMPTY'){return @{Present=$false;Value=''}}
-    $values=@();$present=$false
-    foreach($line in ($Reply -split '\r?\n')){
-        if(-not $line.Trim()){continue}
-        if($line -notmatch '^COOKIE\|((?:[0-9a-fA-F]{2})*)\|(\d+)$'){throw 'Cookie response is unavailable.'}
-        $hex=$Matches[1];$encrypted=[int]$Matches[2]
-        if($hex.Length -gt 65536){throw 'Cookie value exceeds its supported size.'}
-        if($hex -or $encrypted){$present=$true}
-        if($hex){$bytes=New-Object byte[] ($hex.Length/2);for($i=0;$i -lt $bytes.Length;$i++){$bytes[$i]=[Convert]::ToByte($hex.Substring($i*2,2),16)};$value=[Text.UTF8Encoding]::new($false,$true).GetString($bytes);if($value -cmatch '[\x00-\x20\x7f-\uffff]'){throw 'Cookie value is unsupported.'};$values+=@($value)}
-    }
-    $unique=[Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal);foreach($value in $values){$null=$unique.Add($value)};$distinct=@($unique)
-    if($distinct.Count -gt 1){throw 'Cookie rows are ambiguous.'}
-    return @{Present=$present;Value=$(if($distinct.Count){[string]$distinct[0]}else{''})}
-}
-
-function Read-GameAppCookieValues {
-    param([string[]]$Packages=$Config.GamePackages)
-    $results=@{};$requested=[Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
-    foreach($package in $Packages){
-        if($package -notmatch '^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z0-9_]+)+$' -or -not $requested.Add($package)){throw 'Invalid cookie batch package list.'}
-        $results[$package]=@{Known=$false;Present=$false;Value=''}
-    }
-    if(-not $requested.Count){return $results}
-    $scriptText=@'
-for pkg in __PACKAGES__; do
-  printf 'COOKIE_BEGIN|%s\n' "$pkg"
-  db="/data/data/$pkg/app_webview/Default/Cookies"
-  if test -f "$db"; then
-    if sqlite3 "$db" <<'LAUNCHER_COOKIE_SQL'
-.bail on
-.timeout 5000
-PRAGMA query_only=ON;
-SELECT 'COOKIE|'||hex(value)||'|'||length(encrypted_value) FROM cookies WHERE name='.ROBLOSECURITY' AND host_key IN ('.roblox.com','roblox.com') AND path='/';
-LAUNCHER_COOKIE_SQL
-    then echo 'COOKIE_STATUS|OK'; else echo 'COOKIE_STATUS|FAILED'; fi
-  else
-    echo LAUNCHER_COOKIE_EMPTY
-    echo 'COOKIE_STATUS|OK'
-  fi
-  printf 'COOKIE_END|%s\n' "$pkg"
-done
-'@.Replace('__PACKAGES__',($Packages -join ' '))
-    try{
-        
-        
-        $reply=Invoke-GameCookieAdb -Command 'su -c sh' -InputText $scriptText
-        $seen=[Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
-        $current='';$status='';$lines=New-Object 'System.Collections.Generic.List[string]'
-        foreach($line in ($reply -split '\r?\n')){
-            if(-not $line){continue}
-            if($line -cmatch '^COOKIE_BEGIN\|(.+)$'){
-                $package=$Matches[1]
-                if($current -or -not $requested.Contains($package) -or -not $seen.Add($package)){throw 'Invalid cookie batch framing.'}
-                $current=$package;$status='';$lines.Clear();continue
-            }
-            if($line -cmatch '^COOKIE_END\|(.+)$'){
-                if(-not $current -or $Matches[1] -cne $current -or -not $status){throw 'Incomplete cookie batch result.'}
-                if($status -ceq 'OK'){
-                    try{$value=ConvertFrom-GameAppCookieResponse ($lines -join "`n");$value.Known=$true;$results[$current]=$value}
-                    catch{$results[$current]=@{Known=$false;Present=$false;Value=''}}
-                }
-                $current='';continue
-            }
-            if(-not $current -or $status){throw 'Unexpected cookie batch response.'}
-            if($line -cmatch '^COOKIE_STATUS\|(OK|FAILED)$'){$status=$Matches[1];continue}
-            $lines.Add($line)
-        }
-        if($current -or $seen.Count -ne $requested.Count){throw 'The cookie batch response did not finish.'}
-        return $results
-    }catch [System.Management.Automation.PipelineStoppedException]{throw}
-    catch [OperationCanceledException]{throw}
-    catch{
-        foreach($package in $Packages){$results[$package]=@{Known=$false;Present=$false;Value=''}}
-        return $results
-    }
-}
-
-function Update-StagedGameAppCookieDatabase {
-    param([string]$Stage,[string]$Package,[string]$Cookie)
-    $remote='/data/local/tmp/launcher-cookie-'+[guid]::NewGuid().ToString('N');$database=$remote+'/Cookies'
-    try{
-        $null=Invoke-GameAppDataAdb @('shell',"mkdir -m 700 $remote")
-        foreach($name in @('Cookies','Cookies-wal')){if([IO.File]::Exists((Join-Path $Stage $name))){$null=Invoke-GameAppDataAdb @('push',(Join-Path $Stage $name),($remote+'/'+$name))}}
-        $before=Read-GameAppCookieValue -Package $Package -Database $database
-        if($before.Value -ceq $Cookie){return $false}
-        $hex=[BitConverter]::ToString([Text.Encoding]::UTF8.GetBytes($Cookie)).Replace('-','')
-        $sql=".bail on`n.timeout 5000`nBEGIN IMMEDIATE;`nUPDATE cookies SET value=CAST(X'$hex' AS TEXT),encrypted_value=X'' WHERE name='.ROBLOSECURITY' AND host_key IN ('.roblox.com','roblox.com') AND path='/';`nCOMMIT;`nPRAGMA wal_checkpoint(TRUNCATE);`nPRAGMA journal_mode=DELETE;`nPRAGMA quick_check;"
-        $reply=Invoke-GameCookieAdb -Command ("su -c 'sqlite3 $database'") -InputText $sql
-        if($reply -notmatch '(?m)^ok\s*$' -or (Read-GameAppCookieValue -Package $Package -Database $database).Value -cne $Cookie){throw 'The staged cookie database update was not verified.'}
-        $remoteHash=Invoke-GameAppDataAdb @('shell',"su -c 'sha256sum $database'")
-        if($remoteHash -notmatch '^([A-Fa-f0-9]{64})\s'){throw 'The staged cookie database hash is unavailable.'};$expected=$Matches[1]
-        $local=Join-Path $Stage 'Cookies.updated';$null=Invoke-GameAppDataAdb @('pull',$database,$local)
-        if((Get-FileHash -LiteralPath $local -Algorithm SHA256).Hash -ine $expected){throw 'The updated cookie database transfer failed verification.'}
-        return $true
-    }finally{try{$null=Invoke-GameAppDataAdb @('shell',"su -c 'rm -rf $remote'")}catch{}}
-}
-
-function Initialize-LocalCookieDatabaseNative {
-    if('LauncherLocalCookieDatabase' -as [type]){return}
-    $gate=[string]::Intern('Launcher.LocalCookieDatabase');[Threading.Monitor]::Enter($gate)
-    try{
-    if('LauncherLocalCookieDatabase' -as [type]){return}
-    Add-Type -TypeDefinition @'
-using System;
-using System.IO;
-using System.Text;
-using System.Collections.Generic;
-using System.Runtime.InteropServices;
-public static class LauncherLocalCookieDatabase {
-    [UnmanagedFunctionPointer(CallingConvention.Cdecl)] delegate int Row(IntPtr p,int n,IntPtr values,IntPtr names);
-    [DllImport("winsqlite3.dll",CallingConvention=CallingConvention.Cdecl,EntryPoint="sqlite3_open_v2")] static extern int Open(IntPtr path,out IntPtr db,int flags,IntPtr vfs);
-    [DllImport("winsqlite3.dll",CallingConvention=CallingConvention.Cdecl,EntryPoint="sqlite3_close")] static extern int Close(IntPtr db);
-    [DllImport("winsqlite3.dll",CallingConvention=CallingConvention.Cdecl,EntryPoint="sqlite3_exec")] static extern int Exec(IntPtr db,[MarshalAs(UnmanagedType.LPStr)]string sql,Row row,IntPtr p,out IntPtr error);
-    [DllImport("winsqlite3.dll",CallingConvention=CallingConvention.Cdecl,EntryPoint="sqlite3_free")] static extern void Free(IntPtr p);
-    static List<string> Query(IntPtr db,string sql) {
-        var result=new List<string>();Row callback=delegate(IntPtr p,int n,IntPtr values,IntPtr names){var fields=new string[n];for(int i=0;i<n;i++)fields[i]=Marshal.PtrToStringAnsi(Marshal.ReadIntPtr(values,i*IntPtr.Size))??"";result.Add(String.Join("|",fields));return 0;};
-        IntPtr error;int rc=Exec(db,sql,callback,IntPtr.Zero,out error);if(error!=IntPtr.Zero)Free(error);if(rc!=0)throw new IOException("The local snapshot cookie database operation failed.");return result;
-    }
-    const string Where=" WHERE name='.ROBLOSECURITY' AND host_key IN ('.roblox.com','roblox.com') AND path='/'";
-    static bool Matches(IntPtr db,string hex) {
-        var rows=Query(db,"SELECT hex(value),length(encrypted_value) FROM cookies"+Where+";");
-        if(rows.Count==0)throw new IOException("The snapshot cookie row is missing.");
-        foreach(string row in rows)if(row!=hex+"|0")return false;return true;
-    }
-    public static bool Update(string stage,string cookie) {
-        if(String.IsNullOrEmpty(cookie)||cookie.Length>32768)throw new IOException("The captured cookie is invalid.");
-        foreach(char c in cookie)if(c<=32||c>=127)throw new IOException("The captured cookie is invalid.");
-        string path=Path.Combine(stage,"Cookies");byte[] utf8=Encoding.UTF8.GetBytes(path+"\0");IntPtr memory=Marshal.AllocHGlobal(utf8.Length),db=IntPtr.Zero;
-        string hex=BitConverter.ToString(Encoding.UTF8.GetBytes(cookie)).Replace("-","");
-        try {
-            Marshal.Copy(utf8,0,memory,utf8.Length);if(Open(memory,out db,2,IntPtr.Zero)!=0)throw new IOException("The local snapshot cookie database could not be opened.");
-            Query(db,"PRAGMA busy_timeout=5000;");if(Matches(db,hex))return false;
-            Query(db,"BEGIN IMMEDIATE;UPDATE cookies SET value=CAST(X'"+hex+"' AS TEXT),encrypted_value=X''"+Where+";COMMIT;");
-            var checkpoint=Query(db,"PRAGMA wal_checkpoint(TRUNCATE);");if(checkpoint.Count>0&&!checkpoint[0].StartsWith("0|"))throw new IOException("Snapshot cookie checkpoint did not finish.");
-            Query(db,"PRAGMA journal_mode=DELETE;");var check=Query(db,"PRAGMA quick_check;");if(check.Count!=1||check[0]!="ok"||!Matches(db,hex))throw new IOException("The local snapshot cookie update failed verification.");
-        } finally {if(db!=IntPtr.Zero)Close(db);Marshal.FreeHGlobal(memory);}
-        File.Copy(path,Path.Combine(stage,"Cookies.updated"),false);return true;
-    }
-}
-'@
-    }finally{[Threading.Monitor]::Exit($gate)}
-}
-
-function Get-PendingGameAppCookiePath {
-    param($Paths)
-    $path=Join-Path ([IO.Path]::GetDirectoryName($Paths.Directory)) ('.cookie-update-'+[IO.Path]::GetFileName($Paths.Directory)+'.json')
-    Assert-InstanceReplacementDirectory $path $Paths.Root
-    return $path
-}
-
-function Read-PendingGameAppCookieUpdate {
-    param($Paths)
-    $path=Get-PendingGameAppCookiePath $Paths
-    if(-not [IO.File]::Exists($path)){return $null}
-    Assert-InstanceReplacementDirectory $path $Paths.Root
-    $pending=ConvertFrom-Json ([IO.File]::ReadAllText($path))
-    if($pending.Version -ne 1 -or $pending.Package -cne [IO.Path]::GetFileName($Paths.Directory) -or $pending.Token -notmatch '^[a-f0-9]{32}$' -or -not $pending.Cookie -or $pending.Cookie.Length -gt 32768 -or $pending.Cookie -cmatch '[\x00-\x20\x7f-\uffff]'){throw 'The pending cookie update is invalid. Saved data was preserved.'}
-    return $pending
-}
-
-function Save-PendingGameAppCookieUpdate {
-    param($Paths,[string]$Cookie)
-    if(-not $Cookie -or $Cookie.Length -gt 32768 -or $Cookie -cmatch '[\x00-\x20\x7f-\uffff]'){throw 'The captured cookie is invalid.'}
-    $null=[IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($Paths.Directory))
-    $path=Get-PendingGameAppCookiePath $Paths;$temp=$path+'.'+[guid]::NewGuid().ToString('N')+'.tmp'
-    try{
-        [IO.File]::WriteAllText($temp,'',[Text.UTF8Encoding]::new($false));Protect-GameCookieFile $temp
-        Write-TemplateStageManifest $temp @{Version=1;Package=[IO.Path]::GetFileName($Paths.Directory);Token=[guid]::NewGuid().ToString('N');Cookie=$Cookie}
-        Protect-GameCookieFile $temp
-        if([IO.File]::Exists($path)){[IO.File]::Replace($temp,$path,[NullString]::Value)}else{[IO.File]::Move($temp,$path)}
-        Protect-GameCookieFile $path
-        if((Read-PendingGameAppCookieUpdate $Paths).Cookie -cne $Cookie){throw 'The pending cookie could not be verified.'}
-    }finally{if([IO.File]::Exists($temp)){[IO.File]::Delete($temp)}}
-}
-
-function Invoke-PendingGameAppCookieUpdates {
-    if(-not $Config.CookieStorePath){return $true}
-    foreach($package in $Config.GamePackages){
-        $paths=Get-GameAppDataPaths -Package $package
+    $directory=[IO.Path]::GetDirectoryName($Config.ConfigFilePath)
+    if(Test-FlowStopRequested){throw [OperationCanceledException]::new('Stopped before the backup force-close pass.')}
+    $result=Invoke-LauncherForceCloseProcesses $directory
+    if(@($result.Remaining).Count){throw 'Force close did not finish. No backup was started.'}
+    Assert-AllBackupEmulatorsClosed
+    $prepared=@{};$issues=New-Object 'System.Collections.Generic.List[string]'
+    foreach($id in $ids){
+        if(Test-FlowStopRequested){throw [OperationCanceledException]::new('Stopped before offline account validation.')}
+        Assert-AllBackupEmulatorsClosed
+        $old=Join-Path $Config.LdPlayerInstallPath "vms\leidian$id"
+        $sources=@{'data.vmdk'=(Join-Path $old 'data.vmdk');'sdcard.vmdk'=(Join-Path $old 'sdcard.vmdk');'leidian.config'=(Join-Path $Config.LdPlayerInstallPath "vms\config\leidian$id.config")}
         try{
-            $pending=Read-PendingGameAppCookieUpdate $paths
-            if(-not $pending){continue}
-            Assert-PoolSetupTurn;Enter-EmulatorLoadingSlot
-            $result=Sync-GameAppSnapshotCookie -Package $package -ReportResult -UseCapturedCookie -CapturedCookie $pending.Cookie
-            if($result -notin @('Updated','Matched')){throw 'The saved snapshot is unavailable for the captured cookie update.'}
-            
-            
-            $current=Read-PendingGameAppCookieUpdate $paths
-            if($current -and $current.Token -ceq $pending.Token){[IO.File]::Delete((Get-PendingGameAppCookiePath $paths))}
-            Write-FlowStatus "Saved $package snapshot cookie and standalone .ROBLOSECURITY updated from the monitor capture. No live ADB read was needed."
-        }catch [System.Management.Automation.PipelineStoppedException]{throw}
-        catch [OperationCanceledException]{throw}
-        catch{
-            Write-FlowStatus 'Captured cookie update did not finish. Kept the protected pending value and saved data for another loading slot.'
-            return $false
-        }
+            $sources['leidian.vbox']=Get-ClosedInstanceVmSource $Config ([int]$id)
+            foreach($source in $sources.Values){Assert-InstanceReplacementDirectory $source (Join-Path $Config.LdPlayerInstallPath 'vms');if(-not [IO.File]::Exists($source)){throw 'A required emulator file is missing.'}}
+            $accounts=Read-OfflineBackupAccounts $sources['data.vmdk'] $Config.GamePackages $Config.RestoreStateDirectory
+            foreach($package in $Config.GamePackages){if($accounts[$package].Missing.Count){$issues.Add("LDPlayer $id / $package : "+($accounts[$package].Missing -join ', '))}}
+            $prepared[[int]$id]=@{Sources=$sources;Accounts=$accounts;Stamps=@(foreach($name in $sources.Keys){$file=Get-Item -LiteralPath $sources[$name];@{Name=$name;Length=$file.Length;Ticks=$file.LastWriteTimeUtc.Ticks}})}
+        }catch{$issues.Add("LDPlayer $id : offline account/files could not be read.")}
     }
-    return $true
-}
-
-function Complete-GameAppCookieArchiveCleanup {
-    param($Paths,$Entry)
-    $retired=@($Entry.CookieRetiredArchives|Where-Object{$_})
-    foreach($name in $retired){
-        if($name -notmatch '^snapshot-[a-f0-9]{32}[.]tar$' -or $name -ceq $Entry.Archive){throw 'The saved-cookie archive cleanup record is invalid.'}
-        $old=Join-Path $Paths.Directory $name;Assert-InstanceReplacementDirectory $old $Paths.Root
-        if([IO.File]::Exists($old)){[IO.File]::Delete($old)}
+    if($issues.Count){Set-DiskBackupNotice $issues.ToArray();throw ('Account preflight failed; no new backups were created. '+($issues -join '; '))}
+    foreach($id in $missing){
+        Assert-AllBackupEmulatorsClosed
+        $entry=$prepared[[int]$id]
+        foreach($stamp in $entry.Stamps){$file=Get-Item -LiteralPath $entry.Sources[$stamp.Name];if($file.Length -ne $stamp.Length -or $file.LastWriteTimeUtc.Ticks -ne $stamp.Ticks){throw 'An emulator file changed after account validation. Backup was postponed.'}}
+        Save-OfflineEmulatorBackup $Config ([int]$id) $entry.Sources $entry.Accounts
     }
-    if($retired.Count){$Entry.PSObject.Properties.Remove('CookieRetiredArchives');Write-TemplateStageManifest $Paths.Manifest $Entry}
+    $warning=Join-Path $directory 'backup-warning.json';if([IO.File]::Exists($warning)){[IO.File]::Delete($warning)}
+    Write-Host 'Offline emulator backups are ready. Root stays OFF; no app-data maintenance boot is needed.'
 }
 
-function Clear-GameAppCookieSyncStage {
-    param($Paths)
-    $stage=Join-Path $Paths.Directory '.cookie-sync';Assert-InstanceReplacementDirectory $stage $Paths.Root
-    if(-not [IO.Directory]::Exists($stage)){return}
-    $pending=Join-Path $stage 'pending.json'
-    if([IO.File]::Exists($pending)){
-        $name=[string](ConvertFrom-Json ([IO.File]::ReadAllText($pending))).Archive
-        if($name -notmatch '^snapshot-[a-f0-9]{32}[.]tar$'){throw 'The pending cookie snapshot record is invalid. Saved files were preserved.'}
-        $current=Read-GameAppDataManifest $Paths
-        if(-not $current){throw 'The pending cookie update has no readable snapshot manifest. Saved files were preserved.'}
-        if($name -cne $current.Archive){$orphan=Join-Path $Paths.Directory $name;Assert-InstanceReplacementDirectory $orphan $Paths.Root;if([IO.File]::Exists($orphan)){[IO.File]::Delete($orphan)}}
-    }
-    foreach($child in @(Get-ChildItem -LiteralPath $stage -Force -Recurse)){Assert-InstanceReplacementDirectory $child.FullName $Paths.Root}
-    [IO.Directory]::Delete($stage,$true)
-}
 
-function Sync-GameAppSnapshotCookie {
-    param([string]$Package,[switch]$ReportResult,[switch]$UseCapturedCookie,[string]$CapturedCookie='')
-    $paths=Get-GameAppDataPaths -Package $Package
-    
-    $local=Read-SavedGameAppCookie $paths
-    $live=if($UseCapturedCookie){@{Value=$CapturedCookie}}else{Read-GameAppCookieValue -Package $Package}
-    if(-not $live.Value){if($ReportResult){return 'NoLiveCookie'};return}
-    $entry=Read-GameAppDataManifest $paths;if(-not $entry){if($ReportResult){return 'NoSnapshot'};return}
-    Clear-GameAppCookieSyncStage $paths
-    $hash=[Security.Cryptography.SHA256]::Create()
-    try{$cookieHash=[BitConverter]::ToString($hash.ComputeHash([Text.Encoding]::UTF8.GetBytes($live.Value))).Replace('-','')}finally{$hash.Dispose()}
-    if($local -ceq $live.Value -and $entry.CookieSha256 -ceq $cookieHash){Complete-GameAppCookieArchiveCleanup $paths $entry;if($ReportResult){return 'Matched'};return}
-    $archive=Join-Path $paths.Directory $entry.Archive
-    if((Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash -cne $entry.Sha256){throw 'Saved app-data verification failed before cookie synchronization. No saved cookie was changed.'}
-    Initialize-GameAppCookieArchiveNative
-    $stage=Join-Path $paths.Directory '.cookie-sync';Assert-InstanceReplacementDirectory $stage $paths.Root
-    $stop=if($Config.StopFilePath){$Config.StopFilePath}else{$env:LAUNCHER_FLOW_STOP_FILE}
-    $candidate=$null
-    try{
-        $null=[IO.Directory]::CreateDirectory($stage)
-        if(-not [LauncherGameCookieTar]::Extract($archive,$Package,$stage,$stop)){throw 'The saved app-data archive has no cookie database. Saved files were kept.'}
-        if($UseCapturedCookie){Initialize-LocalCookieDatabaseNative;$changed=[LauncherLocalCookieDatabase]::Update($stage,$live.Value)}
-        else{$changed=Update-StagedGameAppCookieDatabase $stage $Package $live.Value}
-        if($changed){
-            $candidate=Join-Path $stage ('snapshot-'+[guid]::NewGuid().ToString('N')+'.tar')
-            [LauncherGameCookieTar]::Rewrite($archive,$candidate,$Package,(Join-Path $stage 'Cookies.updated'),$stop)
-            $verify=Join-Path $stage 'verify';$null=[IO.Directory]::CreateDirectory($verify)
-            if(-not [LauncherGameCookieTar]::Extract($candidate,$Package,$verify,$stop) -or (Get-FileHash -LiteralPath (Join-Path $verify 'Cookies')).Hash -cne (Get-FileHash -LiteralPath (Join-Path $stage 'Cookies.updated')).Hash -or [IO.File]::Exists((Join-Path $verify 'Cookies-wal'))){throw 'The updated archive cookie database failed verification.'}
-            $newName=[IO.Path]::GetFileName($candidate);$newArchive=Join-Path $paths.Directory $newName
-            $retired=@(@($entry.CookieRetiredArchives|Where-Object{$_})+@($entry.Archive)|Select-Object -Unique)
-            $entry.Archive=$newName;$entry.Length=([IO.FileInfo]$candidate).Length;$entry.Sha256=(Get-FileHash -LiteralPath $candidate -Algorithm SHA256).Hash
-            $entry|Add-Member NoteProperty CookieRetiredArchives $retired -Force
-            Write-TemplateStageManifest (Join-Path $stage 'pending.json') @{Archive=$newName}
-            Protect-GameCookieFile $candidate;[IO.File]::Move($candidate,$newArchive);$candidate=$null
-        }
-        $entry|Add-Member NoteProperty CookieSha256 $cookieHash -Force
-        
-        
-        Write-TemplateStageManifest $paths.Manifest $entry
-        $published=Read-GameAppDataManifest $paths
-        if($published.Sha256 -cne $entry.Sha256 -or $published.CookieSha256 -cne $cookieHash){throw 'The updated snapshot manifest could not be verified.'}
-        Write-SavedGameAppCookie $paths $live.Value
-        Complete-GameAppCookieArchiveCleanup $paths $published
-        Write-FlowStatus "Verified saved $Package archive cookie and updated its local .ROBLOSECURITY value. Cookie contents are not logged."
-        if($ReportResult){return 'Updated'}
-    }finally{Clear-GameAppCookieSyncStage $paths}
-}
 
-function Invoke-RegularGameAppCookieTurn {
-    param([ref]$Batch)
-    if(-not $Config.CookieStorePath -or $script:PoolRole -ne 'Monitor'){return 'Continue'}
-    try{
-        $paths=Get-GameAppDataPaths -Package $Config.GamePackage
-        $pending=Read-PendingGameAppCookieUpdate $paths
-        if(-not $pending){
-            
-            
-            $local=Read-SavedGameAppCookie $paths
-            if($null -eq $Batch.Value){$Batch.Value=Read-GameAppCookieValues -Packages $Config.GamePackages}
-            $live=$Batch.Value[$Config.GamePackage]
-            if(-not $live.Known){Write-FlowStatus 'Regular cookie comparison is unavailable for this app. Saved data was kept; checking again next monitor turn.';return 'Continue'}
-            if(-not $live.Value -or $live.Value -ceq $local){return 'Continue'}
-            Save-PendingGameAppCookieUpdate $paths $live.Value
-            Write-FlowStatus 'Live cookie differs from the standalone saved cookie. Saved a protected pending cookie; snapshot and standalone updates are queued for a setup loading slot.'
-        }
-    }catch [System.Management.Automation.PipelineStoppedException]{throw}
-    catch [OperationCanceledException]{throw}
-    catch{
-        Write-FlowStatus 'Regular cookie comparison/capture is unavailable. Saved data and the running app were left unchanged; checking again next monitor turn.'
-        return 'Continue'
-    }
-    Assert-PoolSetupTurn
-}
 
-function Save-GameAppDataSnapshot {
-    param([string]$Package)
-    $paths=Get-GameAppDataPaths -Package $Package;$previous=Read-GameAppDataManifest $paths
-    if($previous){Write-FlowStatus "Saved $Package game data already exists. Keeping it without stopping the app.";return $true}
-    $token=[guid]::NewGuid().ToString('N');$name="snapshot-$token.tar"
-    $stage=Join-Path ([IO.Path]::GetDirectoryName($paths.Directory)) ('.capture-'+$token)
-    Assert-InstanceReplacementDirectory $stage $paths.Root
-    $local=Join-Path $stage $name
-    $remote="/data/local/tmp/launcher-data-$token.tar"
-    $scriptText=@'
-set -eu
-pkg='__PACKAGE__'
-archive='__REMOTE__'
-if test ! -d "/data/data/$pkg"; then echo LAUNCHER_DATA_EMPTY; exit 0; fi
-am force-stop "$pkg"
-attempt=0
-while pidof "$pkg" >/dev/null 2>&1; do
-  attempt=$((attempt+1)); test "$attempt" -lt 10 || exit 66
-  sleep 0.5
-done
-set -- "data/data/$pkg"
-for area in data obb media; do
-  test ! -d "/sdcard/Android/$area/$pkg" || set -- "$@" "sdcard/Android/$area/$pkg"
-done
-tar --exclude="data/data/$pkg/lib" -cpf "$archive" -C / "$@"
-chown 2000:2000 "$archive"
-chmod 600 "$archive"
-echo LAUNCHER_DATA_SAVED
-'@.Replace('__PACKAGE__',$Package).Replace('__REMOTE__',$remote)
-    try{
-        $null=[IO.Directory]::CreateDirectory($stage)
-        Write-FlowStatus "Saving $Package game data. The app is stopped briefly for a consistent snapshot..."
-        $result=Invoke-GameAppDataAdb @('shell','su -c sh') $scriptText
-        Clear-ProcessCheckCache
-        if($result -match '(?m)^LAUNCHER_DATA_EMPTY\s*$'){Write-FlowStatus "No existing $Package game data yet. The app will open normally.";return $false}
-        if($result -notmatch '(?m)^LAUNCHER_DATA_SAVED\s*$'){throw 'Android did not confirm the game-data snapshot.'}
-        $null=Invoke-GameAppDataAdb @('pull',$remote,$local)
-        if(-not [IO.File]::Exists($local) -or ([IO.FileInfo]$local).Length -lt 1024){throw 'The game-data snapshot is incomplete.'}
-        Protect-GameCookieFile -Path $local
-        $manifest=@{Version=1;Package=$Package;Archive=$name;Length=([IO.FileInfo]$local).Length;Sha256=(Get-FileHash -LiteralPath $local -Algorithm SHA256).Hash;SavedUtc=[datetime]::UtcNow.ToString('o');RestoreRequired=$false}
-        Write-TemplateStageManifest (Join-Path $stage 'manifest.json') $manifest
-        try{
-            
-            
-            if([IO.Directory]::Exists($paths.Directory) -and [IO.Directory]::GetFileSystemEntries($paths.Directory).Length -eq 0){
-                Assert-InstanceReplacementDirectory $paths.Directory $paths.Root
-                [IO.Directory]::Delete($paths.Directory,$false)
-            }
-            [IO.Directory]::Move($stage,$paths.Directory)
-        }catch [IO.IOException]{
-            if(-not (Read-GameAppDataManifest $paths)){throw}
-            Write-FlowStatus "Saved $Package game data appeared during capture. Keeping the existing snapshot."
-            return $true
-        }
-        Write-FlowStatus "Saved $Package game data for LDPlayer $InstanceIndex. Archive and manifest verified and published together."
-        return $true
-    }finally{
-        if([IO.Directory]::Exists($stage)){
-            Assert-InstanceReplacementDirectory $stage $paths.Root
-            foreach($child in @(Get-ChildItem -LiteralPath $stage -Force -Recurse)){Assert-InstanceReplacementDirectory $child.FullName $paths.Root}
-            [IO.Directory]::Delete($stage,$true)
-        }
-        try{$null=Invoke-GameAppDataAdb @('shell',"su -c 'rm -f $remote'")}catch{}
-    }
-}
 
-function Restore-GameAppDataSnapshot {
-    param([string]$Package,[switch]$ForMissingCookie)
-    $paths=Get-GameAppDataPaths -Package $Package;$entry=Read-GameAppDataManifest $paths
-    if(-not $entry -or (-not $entry.RestoreRequired -and -not $ForMissingCookie)){return $false}
-    $archive=Join-Path $paths.Directory $entry.Archive
-    if((Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash -cne $entry.Sha256){throw 'The saved game-data archive failed verification. The app remains closed.'}
-    $remote='/data/local/tmp/launcher-data-'+[guid]::NewGuid().ToString('N')+'.tar'
-    $scriptText=@'
-set -eu
-pkg='__PACKAGE__'
-archive='__REMOTE__'
-uid=$(dumpsys package "$pkg" | sed -n 's/^[[:space:]]*userId=\([0-9]*\).*$/\1/p' | head -n 1)
-case "$uid" in ''|*[!0-9]*) exit 62;; esac
-tar -tf "$archive" > "$archive.list"
-while IFS= read -r item; do
-  case "$item" in /*|*../*|../*|*/..|..) exit 63;; esac
-  case "$item" in "data/data/$pkg"|"data/data/$pkg/"*|"sdcard/Android/data/$pkg"|"sdcard/Android/data/$pkg/"*|"sdcard/Android/obb/$pkg"|"sdcard/Android/obb/$pkg/"*|"sdcard/Android/media/$pkg"|"sdcard/Android/media/$pkg/"*) ;; *) exit 64;; esac
-done < "$archive.list"
-grep -q "^data/data/$pkg/" "$archive.list" || exit 65
-am force-stop "$pkg"
-pm clear "$pkg" | grep -q Success
-for area in data obb media; do rm -rf "/sdcard/Android/$area/$pkg"; done
-tar -xof "$archive" -C /
-chown -R "$uid:$uid" "/data/data/$pkg"
-chmod 700 "/data/data/$pkg"
-restorecon -RF "/data/data/$pkg"
-rm -f "$archive.list"
-echo LAUNCHER_DATA_RESTORED
-'@.Replace('__PACKAGE__',$Package).Replace('__REMOTE__',$remote)
-    try{
-        Write-FlowStatus "Restoring saved $Package game data before opening the app..."
-        $null=Invoke-GameAppDataAdb @('push',$archive,$remote)
-        $result=Invoke-GameAppDataAdb @('shell','su -c sh') $scriptText
-        if($result -notmatch '(?m)^LAUNCHER_DATA_RESTORED\s*$'){throw 'Android did not confirm game-data restoration. The app remains closed for retry.'}
-        Clear-ProcessCheckCache
-        $entry.RestoreRequired=$false;Write-TemplateStageManifest $paths.Manifest $entry
-        Write-FlowStatus "Restored $Package game data."
-        return $true
-    }finally{try{$null=Invoke-GameAppDataAdb @('shell',"su -c 'rm -f $remote $remote.list'")}catch{}}
-}
 
-function Get-GameAppDataTransferInventory {
-    param($Settings,[int]$Id,[object[]]$VerifiedSnapshots=@())
-    foreach($package in $Settings.GamePackages){
-        $paths=Get-GameAppDataPaths -Id $Id -Package $package -Settings $Settings
-        $entry=Read-GameAppDataManifest $paths
-        if(-not $entry){
-            if([IO.Directory]::Exists($paths.Directory)){throw "Saved game data for LDPlayer $Id, $package is incomplete: its folder has no manifest/snapshot. The old emulator files were kept."}
-            continue
-        }
-        $archive=Join-Path $paths.Directory $entry.Archive;$stamp=(Get-Item -LiteralPath $archive).LastWriteTimeUtc.Ticks
-        $verified=@($VerifiedSnapshots|Where-Object{$_.Package -ceq $package -and $_.Archive -ceq $entry.Archive -and $_.Length -eq $entry.Length -and $_.Sha256 -ceq $entry.Sha256 -and $_.WriteTicks -eq $stamp}).Count -eq 1
-        if(-not $verified -and (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash -cne $entry.Sha256){throw "Saved game data for LDPlayer $Id, $package failed verification. The old emulator files were kept."}
-        @{Package=$package;Archive=$entry.Archive;Length=$entry.Length;Sha256=$entry.Sha256;WriteTicks=$stamp}
-    }
-}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 function Move-GameAppDataIdentity {
     param($Settings,$Journal)
-    $root=Get-GameAppDataRoot $Settings;$old=Join-Path $root "$($Journal.OldId)";$new=Join-Path $root "$($Journal.NewId)"
+    $root=Get-DiskBackupRoot $Settings;$old=Join-Path $root "$($Journal.OldId)";$new=Join-Path $root "$($Journal.NewId)"
     foreach($path in @($old,$new)){Assert-InstanceReplacementDirectory $path $root}
-    $marker=Join-Path $new 'handoff.json'
-    $receipt=$null
-    if([IO.Directory]::Exists($new)){
-        if(-not [IO.File]::Exists($marker) -or (ConvertFrom-Json ([IO.File]::ReadAllText($marker))).Token -cne $Journal.Token){throw 'Another saved app-data identity owns this replacement ID.'}
-        $receipt=ConvertFrom-Json ([IO.File]::ReadAllText($marker))
-    }elseif([IO.Directory]::Exists($old)){
-        $snapshots=@(Get-GameAppDataTransferInventory $Settings $Journal.OldId)
-        $receipt=@{Token=$Journal.Token;OldId=$Journal.OldId;NewId=$Journal.NewId;Snapshots=$snapshots}
-        Write-TemplateStageManifest (Join-Path $old 'handoff.json') $receipt
+    if([IO.Directory]::Exists($old) -and [IO.Directory]::Exists($new)){throw 'Both old and new backup identities exist. Neither backup was overwritten.'}
+    if([IO.Directory]::Exists($old)){
+        $entry=Get-DiskBackupEntry $Settings $Journal.OldId
+        if(-not $entry){throw 'The replacement backup is incomplete. Old emulator files were kept.'}
+        Write-TemplateStageManifest (Join-Path $old 'handoff.json') @{OldId=$Journal.OldId;NewId=$Journal.NewId;Token=$Journal.Token}
         [IO.Directory]::Move($old,$new)
-    }else{Write-FlowStatus "No saved app-data folder exists for LDPlayer $($Journal.OldId). No saved account data was transferred to $($Journal.NewId).";return}
-    $received=@(Get-GameAppDataTransferInventory $Settings $Journal.NewId -VerifiedSnapshots @($receipt.Snapshots))
-    foreach($expected in @($receipt.Snapshots)){
-        if(-not $expected){continue}
-        if(@($received|Where-Object{$_.Package -ceq $expected.Package -and $_.Archive -ceq $expected.Archive -and $_.Length -eq $expected.Length -and $_.Sha256 -ceq $expected.Sha256}).Count -ne 1){throw 'A saved app-data archive disappeared during ID transfer. The old emulator files were kept.'}
     }
-    foreach($snapshot in $received){
-        $paths=Get-GameAppDataPaths -Id $Journal.NewId -Package $snapshot.Package -Settings $Settings;$entry=Read-GameAppDataManifest $paths
-        $entry.RestoreRequired=$true;Write-TemplateStageManifest $paths.Manifest $entry
+    $marker=Join-Path $new 'handoff.json'
+    if(-not [IO.File]::Exists($marker)){throw 'The replacement backup handoff receipt is missing.'}
+    $receipt=ConvertFrom-Json ([IO.File]::ReadAllText($marker))
+    if($receipt.Token -cne $Journal.Token -or $receipt.OldId -ne $Journal.OldId -or $receipt.NewId -ne $Journal.NewId){throw 'Another replacement owns the saved backup identity.'}
+    $path=Join-Path $new 'manifest.json';$manifest=ConvertFrom-Json ([IO.File]::ReadAllText($path))
+    if($manifest.OwnerId -notin @($Journal.OldId,$Journal.NewId)){throw 'Backup ownership does not match the replacement.'}
+    $manifest.OwnerId=[int]$Journal.NewId;Write-TemplateStageManifest $path $manifest
+    $Journal|Add-Member NoteProperty BackupDirectory $new -Force
+    foreach($package in $Settings.GamePackages){
+        $accountPath=Join-Path $new "$package\account.json"
+        $account=ConvertFrom-Json ([IO.File]::ReadAllText($accountPath));$account.emulatorId=[int]$Journal.NewId;Write-TemplateStageManifest $accountPath $account
     }
-    if($receipt -is [Collections.IDictionary]){$receipt.Snapshots=$received}else{$receipt|Add-Member NoteProperty Snapshots $received -Force}
-    Write-TemplateStageManifest $marker $receipt
-    Write-FlowStatus "Renamed app-data $($Journal.OldId) -> $($Journal.NewId). Verified $($received.Count) saved app snapshot(s); restoration is pending before opening apps."
-}
-
-function Test-GameAppCookiePresent {
-    param([string]$Package=$Config.GamePackage)
-    if($Package -notmatch '^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z0-9_]+)+$'){throw 'Invalid game-data package.'}
-    if(-not $script:CookieAdbSerial){
-        $serial=(Invoke-Ld -Arguments @('adb','--index',"$InstanceIndex",'--command','get-serialno')).Trim()
-        if($serial -notmatch '^(emulator-\d+|(?:127\.0\.0\.1|localhost):\d+)$'){throw (New-GameStatusReadError 'Cookie presence is unavailable; no empty cookie was assumed.')}
-        $script:CookieAdbSerial=$serial
-    }
-    $database='/data/data/'+$Package+'/app_webview/Default/Cookies'
-    $command="su -c 'if test -f $database; then sqlite3 $database; else echo LAUNCHER_COOKIE_EMPTY; fi'"
-    $schema=".bail on`n.timeout 5000`nPRAGMA query_only=ON;`nSELECT CASE WHEN EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='cookies') THEN 'LAUNCHER_COOKIE_TABLE' ELSE 'LAUNCHER_COOKIE_EMPTY' END;"
-    try{
-        $reply=Invoke-GameCookieAdb -Command $command -InputText $schema
-        if($reply -ceq 'LAUNCHER_COOKIE_EMPTY'){return $false}
-        if($reply -cne 'LAUNCHER_COOKIE_TABLE'){throw 'Cookie schema presence could not be confirmed.'}
-        $sql=".bail on`n.timeout 5000`nPRAGMA query_only=ON;`nSELECT CASE WHEN EXISTS(SELECT 1 FROM cookies WHERE name='.ROBLOSECURITY' AND host_key IN ('.roblox.com','roblox.com') AND (length(value)>0 OR length(encrypted_value)>0)) THEN 'LAUNCHER_COOKIE_PRESENT' ELSE 'LAUNCHER_COOKIE_EMPTY' END;"
-        $reply=Invoke-GameCookieAdb -Command $command -InputText $sql
-        if($reply -ceq 'LAUNCHER_COOKIE_PRESENT'){return $true}
-        if($reply -ceq 'LAUNCHER_COOKIE_EMPTY'){return $false}
-        throw 'Cookie presence could not be confirmed.'
-    }catch [System.Management.Automation.PipelineStoppedException]{throw}
-    catch [OperationCanceledException]{throw}
-    catch{throw (New-GameStatusReadError 'Could not read cookie presence inside Android. No cookie value was exposed and no empty cookie was assumed.')}
-}
-
-function Save-LoadedEmulatorAppData {
-    param([int]$BootIdentity,[switch]$Force)
-    if($null -eq $script:LoadedAppDataCaptures){$script:LoadedAppDataCaptures=@{}}
-    if($null -eq $script:WaitingAppDataCookies){$script:WaitingAppDataCookies=@{}}
-    try{
-        if($script:CookieAdbBoot -ne $BootIdentity){$script:CookieAdbSerial=$null;$script:CookieAdbBoot=$BootIdentity}
-        Reset-CopiedTemplateAccounts -BootIdentity $BootIdentity
-        foreach($package in $Config.GamePackages){
-            $key="$InstanceIndex|$BootIdentity|$package"
-            if($script:LoadedAppDataCaptures[$key]){continue}
-            $null=Read-SavedGameAppCookie (Get-GameAppDataPaths -Package $package)
-            $present=Test-GameAppCookiePresent -Package $package
-            $saved=Read-GameAppDataManifest (Get-GameAppDataPaths -Package $package)
-            if(-not $present -and $saved){
-                $null=Restore-GameAppDataSnapshot -Package $package -ForMissingCookie
-                $present=Test-GameAppCookiePresent -Package $package
-                if(-not $present){Write-FlowStatus "Restored $package data has no cookie yet. Keeping the saved snapshot and waiting for a login."}
-            }elseif($present -and -not $saved){
-                $captured=Save-GameAppDataSnapshot -Package $package
-                if(-not $captured){throw 'The cookie was present but app data disappeared before it could be saved.'}
-                if(-not (Read-GameAppDataManifest (Get-GameAppDataPaths -Package $package))){throw 'Cookie appeared but the game-data snapshot did not finish.'}
-            }
-            if(-not $present){
-                if(-not $saved){Write-FlowStatus "No usable saved $package snapshot exists at app-data\$InstanceIndex\$package. An empty folder cannot restore an account."}
-                $script:WaitingAppDataCookies[$key]=@{NextCheckAt=[datetime]::UtcNow.AddSeconds([math]::Max(1,$Config.GameCheckInterval));CaptureRequested=$false}
-                Write-FlowStatus "$package has no cookie. Opening the app for login; cookie presence will be checked during regular game checks."
-            }else{Sync-GameAppSnapshotCookie -Package $package;$script:WaitingAppDataCookies.Remove($key)}
-            $script:LoadedAppDataCaptures[$key]=$true
-        }
-        return $true
-    }catch [System.Management.Automation.PipelineStoppedException]{throw}
-    catch [OperationCanceledException]{throw}
-    catch{Write-FlowStatus ('Initial cookie-presence/game-data check will retry before opening apps. '+$_.Exception.Message);return $false}
-}
-
-function Invoke-WaitingGameAppDataTurn {
-    $key="$InstanceIndex|$script:CookieBootIdentity|$($Config.GamePackage)"
-    if(-not $script:WaitingAppDataCookies -or -not $script:WaitingAppDataCookies.ContainsKey($key)){return 'Continue'}
-    $waiting=$script:WaitingAppDataCookies[$key]
-    if($waiting.CaptureRequested -or [datetime]::UtcNow -ge $waiting.NextCheckAt){
-        $waiting.NextCheckAt=[datetime]::UtcNow.AddSeconds([math]::Max(1,$Config.GameCheckInterval))
-        $waiting.CaptureRequested=Test-GameAppCookiePresent
-    }
-    if($waiting.CaptureRequested){
-        
-        
-        Assert-PoolSetupTurn
-        Enter-EmulatorLoadingSlot
-        $saved=Read-GameAppDataManifest (Get-GameAppDataPaths)
-        $captured=if($saved){$true}else{Save-GameAppDataSnapshot -Package $Config.GamePackage}
-        if(-not $captured){throw (New-GameStatusReadError 'The logged-in app data disappeared before it could be saved. Its saved snapshot is unchanged.')}
-        if(-not (Read-GameAppDataManifest (Get-GameAppDataPaths))){throw (New-GameStatusReadError 'The newly logged-in app could not be saved. Keeping it in the capture queue.')}
-        try{Sync-GameAppSnapshotCookie -Package $Config.GamePackage}
-        catch [System.Management.Automation.PipelineStoppedException]{throw}
-        catch [OperationCanceledException]{throw}
-        catch{throw (New-GameStatusReadError 'Saved app-data cookie synchronization did not finish. It remains queued; cookie contents were withheld.')}
-        $script:WaitingAppDataCookies.Remove($key)
-        Write-FlowStatus 'Cookie appeared and saved game data is ready. Continuing the normal app opening and joining flow.'
-        return 'Captured'
-    }
-    if($script:PoolRole -eq 'Monitor'){
-        if(-not (Test-AppRunning -Package $Config.GamePackage)){Assert-PoolSetupTurn}
-        Assert-MonitoredAppVisible
-        if(@(Get-VisibleAppCrashPackages) -ccontains $Config.GamePackage){throw (New-AppCrashError $Config.GamePackage)}
-    }else{
-        Enter-EmulatorLoadingSlot
-        if(-not (Test-AppRunning -Package $Config.GamePackage)){
-            Write-FlowStatus 'Opening this app for login while waiting for a cookie. No game link will be sent yet.'
-            $null=Invoke-Ld -Arguments @('runapp','--index',"$InstanceIndex",'--packagename',$Config.GamePackage)
-            $deadline=[datetime]::UtcNow.AddSeconds($Config.LauncherOpenTimeout)
-            do{
-                if(Test-FlowStopRequested){throw [OperationCanceledException]::new('Stopped while opening the login app.')}
-                if(Test-AppRunning -Package $Config.GamePackage){break}
-                Wait-FlowPause ([math]::Max(1,$Config.PollInterval))
-            }while([datetime]::UtcNow -lt $deadline)
-            if(-not (Test-AppRunning -Package $Config.GamePackage)){throw [TimeoutException]::new('The login app did not open within its configured timeout.')}
-        }
-    }
-    return 'Waiting'
-}
-
-
-function Get-SetupGameAppData {
-    
-    $key="$InstanceIndex|$script:CookieBootIdentity|$($Config.GamePackage)"
-    $ready=[bool]($script:LoadedAppDataCaptures -and $script:LoadedAppDataCaptures[$key])
-    return [pscustomobject]@{Ready=$ready;Changed=$false;NeedsLogin=$false;Unavailable=(-not $ready);Mismatch=$false;ProfilePending=$false;Cookie='';Message='Game-data snapshot';AuthenticationChecked=$true;AppCookiePresent=$false;LocalCookiePresent=$false}
-}
-
-function Prepare-GameAppDataForOpening {
-    param([string]$Package)
-    if($Config.GamePackages -notcontains $Package){return}
-    $key="$InstanceIndex|$script:CookieBootIdentity|$Package"
-    if(-not ($script:LoadedAppDataCaptures -and $script:LoadedAppDataCaptures[$key])){throw (New-GameStatusReadError 'Initial game-data save/restore must finish before opening the app.')}
-}
-
-function Reset-CopiedTemplateAccounts {
-    param([int]$BootIdentity)
-    if(-not $Config.RestoreStateDirectory){return}
-    $path=Get-TemplateAccountResetPath
-    if(-not [IO.File]::Exists($path)){return}
-    $pending=ConvertFrom-Json ([IO.File]::ReadAllText($path))
-    if($pending.TargetIndex -ne $InstanceIndex -or $pending.SourceIndex -eq $InstanceIndex){throw 'Template data cleanup marker does not match this emulator.'}
-    foreach($package in @($pending.Packages)){
-        if(@($pending.Cleared) -contains $package){continue}
-        if($Config.GamePackages -notcontains $package){throw 'Template data cleanup contains an unexpected app package.'}
-        $reply=Invoke-GameAppDataAdb @('shell',"pm clear $package")
-        if($reply -notmatch '(?m)^Success\s*$'){throw 'Copied template app data could not be cleared.'}
-        $pending.Cleared=@($pending.Cleared)+@($package);Write-TemplateStageManifest $path $pending
-    }
-    [IO.File]::Delete($path)
-    Write-FlowStatus 'Template app data cleared. Restoring saved game data before opening apps.'
-}
-
-
-function Invoke-GameCookieAdb {
-    param([string]$Command,[string]$InputText='')
-    
-    $timeout=[math]::Max(1,$Config.CommandTimeout)
-    $watch=[Diagnostics.Stopwatch]::StartNew()
-    Wait-StatusCheckSlot -TimeoutSeconds $timeout
-    $info=New-Object Diagnostics.ProcessStartInfo
-    $info.FileName=Join-Path $Config.LdPlayerInstallPath 'adb.exe'
-    $info.Arguments=(@('-s',$script:CookieAdbSerial,'shell',$Command) | ForEach-Object { ConvertTo-NativeArgument $_ }) -join ' '
-    $info.UseShellExecute=$false; $info.CreateNoWindow=$true
-    $info.RedirectStandardInput=$true; $info.RedirectStandardOutput=$true; $info.RedirectStandardError=$true
-    $process=New-Object Diagnostics.Process; $process.StartInfo=$info
-    try {
-        $null=$process.Start()
-        $output=$process.StandardOutput.ReadToEndAsync(); $errors=$process.StandardError.ReadToEndAsync()
-        $write=$process.StandardInput.WriteLineAsync($InputText)
-        $budget=[int][math]::Max(1,$timeout*1000-$watch.ElapsedMilliseconds)
-        if (-not $write.Wait($budget)) { try {$process.Kill()}catch{}; throw 'Cookie command input timed out.' }
-        $process.StandardInput.Close()
-        $budget=[int][math]::Max(1,$timeout*1000-$watch.ElapsedMilliseconds)
-        if (-not $process.WaitForExit($budget)) { try {$process.Kill()}catch{}; throw 'Cookie command timed out.' }
-        if (-not [Threading.Tasks.Task]::WaitAll([Threading.Tasks.Task[]]@($output,$errors),1000)) { throw 'Cookie command result timed out.' }
-        if($process.ExitCode -ne 0){throw 'Cookie command unavailable.'}
-        return $output.Result.Trim()
-    } catch [System.Management.Automation.PipelineStoppedException] { throw }
-    catch [OperationCanceledException] { throw }
-    catch {
-        $failure=[InvalidOperationException]::new('The emulator cookie operation could not finish. Retrying; diagnostic contents were withheld.')
-        $kind=switch -Exact ($_.Exception.Message){'Cookie command input timed out.'{'InputTimeout'}'Cookie command timed out.'{'ProcessTimeout'}'Cookie command result timed out.'{'ResultTimeout'}default{'CommandUnavailable'}}
-        $failure.Data['CookieOperationKind']=$kind
-        
-        
-        if($Command -match '^curl\s' -and $errors -and $errors.IsCompleted -and -not $errors.IsFaulted){
-            $match=[regex]::Match([string]$errors.Result,'(?m)^curl:\s*\((\d{1,3})\)')
-            if($match.Success){$failure.Data['CurlExitCode']=$match.Groups[1].Value}
-        }
-        throw $failure
-    }
-    finally { $process.Dispose(); $script:LastStatusCheckFinishedTicks=[Diagnostics.Stopwatch]::GetTimestamp() }
-}
-
-function ConvertTo-GameAccountProfile {
-    param($Value)
-    $id=0L
-    if($Value){$null=[long]::TryParse([string]$Value.id,[ref]$id)}
-    if($id -lt 0){$id=0L}
-    $name='';$display=''
-    if($Value){$name=[string]$Value.name;$display=[string]$Value.displayName}
-    if($name.Length -gt 100 -or $display.Length -gt 200 -or $name -match '[\x00-\x1f]' -or $display -match '[\x00-\x1f]'){throw 'Account profile fields are invalid; values were withheld.'}
-    return @{id=$(if($id -gt 0){$id}else{$null});name=$name;displayName=$display}
-}
-
-function Test-GameAccountProfileComplete {
-    param($Profile)
-    return [bool]($Profile -and [long]$Profile.id -gt 0 -and $Profile.name -and $Profile.displayName)
-}
-
-function ConvertFrom-GamePrefsXml {
-    param([string]$Text)
-    if(-not $Text.Trim()){$Text='<?xml version="1.0" encoding="utf-8"?><map />'}
-    $settings=[Xml.XmlReaderSettings]::new();$settings.DtdProcessing=[Xml.DtdProcessing]::Prohibit;$settings.XmlResolver=$null
-    $input=[IO.StringReader]::new($Text);$reader=[Xml.XmlReader]::Create($input,$settings)
-    try{$document=[Xml.XmlDocument]::new();$document.XmlResolver=$null;$document.Load($reader)}finally{$reader.Dispose();$input.Dispose()}
-    if($document.DocumentElement.Name -ne 'map'){throw 'The app preferences have an unsupported format; no account was changed.'}
-    return ,$document
-}
-
-function Get-GameAccountPrefsSnapshot {
-    param([string]$Package=$Config.GamePackage)
-    if($Package -notmatch '^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z0-9_]+)+$'){throw 'Invalid account package.'}
-    $file='/data/data/'+$Package+'/shared_prefs/prefs.xml'
-    $raw=Invoke-GameCookieAdb -Command ("su -c 'if test -f $file; then cat $file; else echo LAUNCHER_PREFS_MISSING; fi'")
-    $exists=$raw -ne 'LAUNCHER_PREFS_MISSING'
-    try{
-        $xml=if($exists){$raw}else{''};$document=ConvertFrom-GamePrefsXml $xml
-        $data=@{id=$null;name='';displayName=''}
-        foreach($pair in @(@('userid_long','id'),@('username','name'),@('displayName','displayName'))){
-            $node=$document.SelectSingleNode('/map/*[@name="'+$pair[0]+'"]')
-            if($node){$value=if($node.HasAttribute('value')){$node.GetAttribute('value')}else{$node.InnerText};$data[$pair[1]]=$value}
-        }
-        return [pscustomobject]@{Exists=$exists;Xml=$xml;Profile=(ConvertTo-GameAccountProfile $data)}
-    }catch{throw 'The app preferences could not be read safely. Profile values were withheld; no account was changed.'}
-    finally{$raw=$null;$xml=$null;$document=$null}
-}
-
-function Set-GameAccountPrefsSnapshot {
-    param([string]$Package,$Snapshot,$Profile,[switch]$Restore,[switch]$Clear)
-    $file='/data/data/'+$Package+'/shared_prefs/prefs.xml'
-    if($Package -notmatch '^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z0-9_]+)+$'){throw 'Invalid account package.'}
-    $xml=$Snapshot.Xml
-    if($Clear){
-        $document=ConvertFrom-GamePrefsXml $Snapshot.Xml
-        foreach($key in @('userid_long','username','displayName')){foreach($old in @($document.SelectNodes('/map/*[@name="'+$key+'"]'))){$null=$old.ParentNode.RemoveChild($old)}}
-        $xml=$document.OuterXml
-    }elseif(-not $Restore){
-        $profileData=ConvertTo-GameAccountProfile $Profile
-        if(-not (Test-GameAccountProfileComplete $profileData)){throw 'A complete account ID, username and display name are required before initializing app preferences.'}
-        $document=ConvertFrom-GamePrefsXml $Snapshot.Xml
-        foreach($pair in @(@('userid_long','id'),@('username','name'),@('displayName','displayName'))){
-            foreach($old in @($document.SelectNodes('/map/*[@name="'+$pair[0]+'"]'))){$null=$old.ParentNode.RemoveChild($old)}
-            $kind=if($pair[1] -eq 'id'){'long'}else{'string'}
-            $node=$document.CreateElement($kind);$node.SetAttribute('name',$pair[0])
-            if($kind -eq 'long'){$node.SetAttribute('value',[string]$profileData.id)}else{$node.InnerText=[string]$profileData[$pair[1]]}
-            $null=$document.DocumentElement.AppendChild($node)
-        }
-        $xml=$document.OuterXml
-    }
-    $token=[guid]::NewGuid().ToString('N')
-    if($Restore -and -not $Snapshot.Exists){
-        $scriptText="set -e`nrm -f '$file'`necho LAUNCHER_PREFS_OK"
-    }else{
-        $encoded=[Convert]::ToBase64String([Text.UTF8Encoding]::new($false).GetBytes($xml))
-        $dir='/data/data/'+$Package+'/shared_prefs';$temp=$file+'.launcher-'+$token
-        $scriptText=@"
-set -e
-mkdir -p '$dir'
-owner=`$(stat -c %u /data/data/$Package)
-group=`$(stat -c %g /data/data/$Package)
-if test -f '$file'; then cp -p '$file' '$temp'; else touch '$temp'; chown "`$owner:`$group" '$temp'; chmod 660 '$temp'; fi
-trap 'rm -f "$temp"' EXIT
-printf '%s' '$encoded' | base64 -d > '$temp'
-mv -f '$temp' '$file'
-chown "`$owner:`$group" '$dir'
-echo LAUNCHER_PREFS_OK
-"@
-    }
-    $reply=Invoke-GameCookieAdb -Command 'su -c sh' -InputText $scriptText
-    if($reply -ne 'LAUNCHER_PREFS_OK'){throw 'App profile update could not be confirmed.'}
-}
-
-function Set-GameAccountPair {
-    param([string]$Package,[string]$Cookie,$CookieSnapshot,$PrefsSnapshot,$Profile)
-    if(-not (Test-GameAccountProfileComplete $Profile)){throw 'Account profile is incomplete. The app cookie was not assigned.'}
-    if(Test-AppRunning -Package $Package){throw 'The app must be closed before updating its account files.'}
-    
-    
-    $profileWritten=$false
-    try{
-        $profileWritten=$true
-        Set-GameAccountPrefsSnapshot -Package $Package -Snapshot $PrefsSnapshot -Profile $Profile
-        $check=Get-GameAccountPrefsSnapshot -Package $Package
-        if(-not (Test-GameAccountProfilesEqual $check.Profile $Profile)){throw 'Profile read-back did not match the selected account.'}
-        Set-GameCookieDatabase -Package $Package -Cookie $Cookie -Snapshot $CookieSnapshot
-        $verified=Get-GameCookieSnapshot -Package $Package
-        if($verified.Value -cne $Cookie -or $verified.Encrypted){throw 'Cookie read-back did not match the selected account.'}
-        $check=Get-GameAccountPrefsSnapshot -Package $Package
-        if(-not (Test-GameAccountProfilesEqual $check.Profile $Profile)){throw 'Account profile changed during the cookie update.'}
-    }catch{
-        $failure=$_
-        if($profileWritten){
-            try{
-                Restore-GameCookieSnapshot -Package $Package -Snapshot $CookieSnapshot
-                Set-GameAccountPrefsSnapshot -Package $Package -Snapshot $PrefsSnapshot -Restore
-            }catch{throw 'Account update and rollback could not both be confirmed. The app remains closed; recovery will retry before opening.'}
-        }
-        throw 'Account files could not be updated together. Previous data was restored where possible; the app remains closed for retry.'
-    }
-}
-
-function Test-GameAccountProfilesEqual {
-    param($Left,$Right)
-    return [bool]((Test-GameAccountProfileComplete $Left) -and (Test-GameAccountProfileComplete $Right) -and [long]$Left.id -eq [long]$Right.id -and [string]$Left.name -ceq [string]$Right.name -and [string]$Left.displayName -ceq [string]$Right.displayName)
+    $null=Get-DiskBackupEntry $Settings $Journal.NewId
+    Write-FlowStatus "Backup identity $($Journal.OldId) -> $($Journal.NewId) verified. Replacement disks already contain both apps' account data."
 }
 
 
 
+function Save-LoadedEmulatorAppData {param([int]$BootIdentity,[switch]$Force)return $true}
 
-function Get-GameCookieSnapshot {
-    param([string]$Package)
-    $database='/data/data/'+$Package+'/app_webview/Default/Cookies'
-    $command="su -c 'if test -f $database; then sqlite3 $database; else echo LAUNCHER_COOKIE_DB_MISSING; fi'"
-    $sql=".bail on`n.timeout 5000`nPRAGMA query_only=ON;`nPRAGMA table_info(cookies);`nSELECT 'COOKIE|'||hex(value)||'|'||length(encrypted_value)||'|'||expires_utc||'|'||hex(encrypted_value) FROM cookies WHERE name='.ROBLOSECURITY' AND host_key='.roblox.com' AND path='/';"
-    $raw=Invoke-GameCookieAdb -Command $command -InputText $sql
-    if ($raw -eq 'LAUNCHER_COOKIE_DB_MISSING') { return [pscustomobject]@{Exists=$false;Columns=@();Count=0;Value='';Encrypted=$false;Expires=0} }
-    $columns=@(); $rows=@()
-    foreach ($line in ($raw -split '\r?\n')) {
-        if ($line -match '^\d+\|([A-Za-z_]+)\|([^|]*)\|([01])\|([^|]*)\|\d+$') {
-            $columns+=[pscustomobject]@{Name=$Matches[1];Type=$Matches[2];Required=($Matches[3] -eq '1');Default=$Matches[4]}
-        } elseif ($line -match '^COOKIE\|([0-9A-Fa-f]*)\|(\d+)\|(\d+)(?:\|([0-9A-Fa-f]*))?$') {
-            $hex=$Matches[1]; $encrypted=[int]$Matches[2]; $expiry=[long]$Matches[3]
-            $encryptedHex=$Matches[4]
-            $bytes=New-Object byte[] ($hex.Length/2)
-            for ($i=0;$i -lt $bytes.Length;$i++) { $bytes[$i]=[Convert]::ToByte($hex.Substring($i*2,2),16) }
-            $rows+=[pscustomobject]@{Value=[Text.Encoding]::UTF8.GetString($bytes);Encrypted=($encrypted -gt 0);EncryptedHex=$encryptedHex;Expires=$expiry}
-        } elseif ($line.Trim()) { throw 'The cookie database returned an unsupported response; no cookie was changed.' }
-    }
-    if ($columns.Count -eq 0 -or $rows.Count -gt 1) { throw 'The cookie schema or number of cookie records is unsupported; waiting without guessing.' }
-    $value=''; $encrypted=$false; $expiry=0;$encryptedHex=''
-    if ($rows.Count -eq 1) { $value=$rows[0].Value; $encrypted=$rows[0].Encrypted;$encryptedHex=$rows[0].EncryptedHex; $expiry=$rows[0].Expires }
-    return [pscustomobject]@{Exists=$true;Columns=$columns;Count=$rows.Count;Value=$value;Encrypted=$encrypted;EncryptedHex=$encryptedHex;Expires=$expiry}
-}
 
-function Restore-GameCookieSnapshot {
-    param([string]$Package,$Snapshot)
-    $db='/data/data/'+$Package+'/app_webview/Default/Cookies'
-    $where="name='.ROBLOSECURITY' AND host_key='.roblox.com' AND path='/'"
-    if($Snapshot.Count -eq 0){$sql="DELETE FROM cookies WHERE $where;"}
-    else{
-        $hex=[string]$Snapshot.EncryptedHex
-        if($hex -notmatch '^(?:[0-9a-fA-F]{2})*$' -or ($Snapshot.Encrypted -and -not $hex)){throw 'Original encrypted cookie is unavailable for rollback.'}
-        $value=([string]$Snapshot.Value).Replace("'","''")
-        $sql="UPDATE cookies SET value='$value',encrypted_value=X'$hex',expires_utc=$([long]$Snapshot.Expires) WHERE $where;"
-    }
-    $null=Invoke-GameCookieAdb -Command ("su -c 'sqlite3 $db'") -InputText (".bail on`n.timeout 5000`nBEGIN IMMEDIATE;`n"+$sql+"`nCOMMIT;")
-}
 
-function Set-GameCookieDatabase {
-    param([string]$Package,[string]$Cookie,$Snapshot,[switch]$Clear,[string]$ExpectedCookie='')
-    $database='/data/data/'+$Package+'/app_webview/Default/Cookies'
-    $predicate="name='.ROBLOSECURITY' AND host_key='.roblox.com' AND path='/'"
-    $escaped=$Cookie.Replace("'","''")
-    $now=[long]([datetime]::UtcNow.ToFileTimeUtc()/10)
-    $expiry=[long]([datetime]::UtcNow.AddDays(30).ToFileTimeUtc()/10)
-    $values=@{creation_utc="$now";host_key="'.roblox.com'";top_frame_site_key="''";name="'.ROBLOSECURITY'";value="'$escaped'";encrypted_value="X''";path="'/'";expires_utc="$expiry";is_secure='1';is_httponly='1';last_access_utc="$now";has_expires='1';is_persistent='1';priority='1';samesite='-1';source_scheme='2';source_port='443';last_update_utc="$now"}
-    if ($Clear) {
-        $sql="UPDATE cookies SET value='',encrypted_value=X'' WHERE $predicate AND value='"+$ExpectedCookie.Replace("'","''")+"';"
-    } elseif ($Snapshot.Count -eq 1) {
-        $assignments=@($Snapshot.Columns | Where-Object {$_.Name -in @('value','encrypted_value','expires_utc','last_access_utc','last_update_utc','has_expires','is_persistent')} | ForEach-Object {$_.Name+'='+$values[$_.Name]})
-        $sql='UPDATE cookies SET '+($assignments -join ',')+" WHERE $predicate;"
-    } else {
-        $names=@(); $literals=@()
-        foreach ($column in $Snapshot.Columns) {
-            if ($values.ContainsKey($column.Name)) { $names+=$column.Name; $literals+=$values[$column.Name] }
-            elseif ($column.Required -and -not $column.Default) { throw 'This cookie schema has an unsupported required column; no session was changed.' }
-        }
-        $sql='INSERT INTO cookies ('+($names -join ',')+') VALUES ('+($literals -join ',')+');'
-    }
-    $command="su -c 'test -f $database && sqlite3 $database'"
-    $null=Invoke-GameCookieAdb -Command $command -InputText (".bail on`n.timeout 5000`nBEGIN IMMEDIATE;`n"+$sql+"`nCOMMIT;")
-}
+
+
+
+function Prepare-GameAppDataForOpening {param([string]$Package)if(Get-NoRootRootMode){throw 'App launches are blocked while root is enabled.'}}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
@@ -3466,7 +2903,7 @@ function Get-InstanceReplacementPaths {
     param($Settings)
     $directory=''
     if($Settings.ConfigFilePath){$directory=[IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($Settings.ConfigFilePath))}
-    elseif($Settings.CookieStorePath){$directory=[IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($Settings.CookieStorePath))}
+    elseif($Settings.ConfigFilePath){$directory=[IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($Settings.ConfigFilePath))}
     if(-not $directory){return $null}
     $state=if($Settings.RestoreStateDirectory){Join-Path $Settings.RestoreStateDirectory 'instance-replacements'}else{Join-Path $directory '.instance-replacement-state'}
     return @{History=(Join-Path $directory 'instance-replacements.json');State=$state}
@@ -3655,14 +3092,17 @@ function Assert-InstanceReplacementDirectory {
     }
 }
 
-function Restore-ReassignedCookieMigration {
+function Restore-ReassignedAppDataMigration {
     param($Settings,$Journal,[int]$PreviousId)
     $root=Get-GameAppDataRoot $Settings;$from=Join-Path $root "$PreviousId";$to=Join-Path $root "$($Journal.OldId)"
     foreach($path in @($from,$to)){Assert-InstanceReplacementDirectory $path $root}
     $marker=Join-Path $from 'handoff.json'
     if([IO.File]::Exists($marker) -and (ConvertFrom-Json ([IO.File]::ReadAllText($marker))).Token -ceq $Journal.Token){
         if([IO.Directory]::Exists($to)){throw 'Both source and reassigned app-data folders exist. Neither was overwritten.'}
-        [IO.Directory]::Move($from,$to)
+                [IO.Directory]::Move($from,$to)
+        $path=Join-Path $to 'manifest.json';$entry=ConvertFrom-Json ([IO.File]::ReadAllText($path));$entry.OwnerId=[int]$Journal.OldId;Write-TemplateStageManifest $path $entry
+        foreach($package in $Settings.GamePackages){$accountPath=Join-Path $to "$package\account.json";$account=ConvertFrom-Json ([IO.File]::ReadAllText($accountPath));$account.emulatorId=[int]$Journal.OldId;Write-TemplateStageManifest $accountPath $account}
+        $Journal|Add-Member NoteProperty BackupDirectory $to -Force
     }
 }
 
@@ -3768,7 +3208,7 @@ function Resolve-InstanceReplacementIdConflict {
             }
         }
     }
-    Restore-ReassignedCookieMigration $Settings $Journal $from
+    Restore-ReassignedAppDataMigration $Settings $Journal $from
     $Journal.NewId=$to;$Journal.Stage=$rehome.ToStage;$Journal.DataUuid=$rehome.DataUuidTo;$Journal.SdUuid=$rehome.SdUuidTo
     if($Journal.PreparedVmText){$Journal.PreparedVmText=$rehome.VmText};if($Journal.PreparedConfigText){$Journal.PreparedConfigText=$rehome.ConfigText}
     if($Journal.Phase -eq 'Ready'){$Journal.Phase='Installed'}
@@ -3820,32 +3260,37 @@ function Get-ClosedInstanceVmSource {
 function New-InstanceReplacementPlan {
     param($Settings,[int]$OldId,[int]$NewId,[switch]$TemplateData)
     if($OldId -le 0 -or $NewId -le $OldId){throw 'The template cannot replace itself, and a replacement ID must be newer.'}
+    $TemplateData=$false
+    $backup=Get-DiskBackupEntry $Settings $OldId
+    if(-not $backup){throw 'No verified emulator backup exists for this replacement.'}
+    $backupId=[int]$backup.Manifest.SourceId
+    $backupRoot=Get-DiskBackupRoot $Settings
     $install=[IO.Path]::GetFullPath($Settings.LdPlayerInstallPath);$vms=Join-Path $install 'vms'
     Assert-InstanceReplacementDirectory $vms $install
     $old=Join-Path $vms "leidian$OldId";$target=Join-Path $vms "leidian$NewId"
     foreach($path in @($old,$target,(Join-Path $vms 'config'))){Assert-InstanceReplacementDirectory $path $vms}
     $targetConfig=Join-Path $vms "config\leidian$NewId.config"
     if((Test-Path -LiteralPath $target) -or (Test-Path -LiteralPath $targetConfig)){throw 'The allocated replacement ID already has files; no existing instance will be overwritten.'}
-    $sourceConfig=Join-Path $vms "config\leidian$OldId.config"
-    $sourceVm=Get-ClosedInstanceVmSource $Settings $OldId -TemplateData:$TemplateData
-    $oldData=Join-Path $old 'data.vmdk';$sd=Join-Path $old 'sdcard.vmdk'
+    $sourceConfig=Join-Path $backup.Directory 'leidian.config'
+    $sourceVm=Join-Path $backup.Directory 'leidian.vbox'
+    $oldData=Join-Path $backup.Directory 'data.vmdk';$sd=Join-Path $backup.Directory 'sdcard.vmdk'
     $missing=New-Object 'System.Collections.Generic.List[string]'
     $copyData=if($TemplateData){(Get-LauncherTemplateFiles $Settings).DataFile}else{$oldData}
     if($TemplateData){$null=Resolve-LauncherRecoverySource -Settings $Settings -CheckClosed}
     foreach($file in @($sourceConfig,$sourceVm,$copyData,$sd)){
-        if(-not ($TemplateData -and $file -ceq $copyData)){Assert-InstanceReplacementDirectory $file $vms}
+        if(-not ($TemplateData -and $file -ceq $copyData)){Assert-InstanceReplacementDirectory $file $backupRoot}
         if(-not [IO.File]::Exists($file)){$missing.Add($file)}
     }
-    if($missing.Count){throw ('Replacement source file missing or inaccessible: '+($missing.ToArray() -join '; ')+'. No replacement files were copied; the original instance and saved cookies were kept.')}
+    if($missing.Count){throw ('Replacement source file missing or inaccessible: '+($missing.ToArray() -join '; ')+'. No replacement files were copied; the original instance and saved app data were kept.')}
     $configuration=ConvertFrom-Json ([IO.File]::ReadAllText($sourceConfig))
     if($configuration.'basicSettings.standaloneSysVmdk'){throw 'This replacement supports the verified shared-system instance layout only.'}
     $xml=[xml]::new();$xml.XmlResolver=$null;$xml.PreserveWhitespace=$true;$xml.Load($sourceVm)
     $machine=$xml.SelectSingleNode('//*[local-name()="Machine"]')
     $data=$xml.SelectSingleNode('//*[local-name()="HardDisk" and @location="data.vmdk"]')
-    if(-not $machine -or $machine.name -cne "leidian$OldId" -or -not $data -or $data.type -cne 'Normal'){throw 'The affected emulator VM registration is unsupported.'}
-    $machineUuid=Get-TemplateTargetUuid $machine.uuid.Trim('{}') $OldId $NewId
-    $sourceDataUuid=$data.uuid.Trim('{}');$dataUuid=Get-TemplateTargetUuid $sourceDataUuid $OldId $NewId
-    $sdUuid=Get-TemplateTargetUuid (Get-TemplateDiskDescriptor $sd).Uuid $OldId $NewId
+    if(-not $machine -or $machine.name -cne "leidian$backupId" -or -not $data -or $data.type -cne 'Normal'){throw 'The affected emulator VM registration is unsupported.'}
+    $machineUuid=Get-TemplateTargetUuid $machine.uuid.Trim('{}') $backupId $NewId
+    $sourceDataUuid=$data.uuid.Trim('{}');$dataUuid=Get-TemplateTargetUuid $sourceDataUuid $backupId $NewId
+    $sdUuid=Get-TemplateTargetUuid (Get-TemplateDiskDescriptor $sd).Uuid $backupId $NewId
     if(-not $TemplateData -and (Get-TemplateDiskDescriptor $oldData).Uuid -ine $sourceDataUuid){throw 'The affected emulator data disk does not match its VM registration. Its files were preserved.'}
     foreach($disk in $xml.SelectNodes('//*[local-name()="HardDisk"]')){
         if($disk -eq $data){continue}
@@ -3855,8 +3300,9 @@ function New-InstanceReplacementPlan {
     $data.SetAttribute('uuid',"{$dataUuid}")
     foreach($image in $xml.SelectNodes('//*[local-name()="Image"]')){if($image.uuid.Trim('{}') -ieq $sourceDataUuid){$image.SetAttribute('uuid',"{$dataUuid}")}}
     $configuration|Add-Member NoteProperty 'statusSettings.playerName' "LDPlayer-$NewId" -Force
+    $configuration|Add-Member NoteProperty 'basicSettings.rootMode' $false -Force
     $configuration|Add-Member NoteProperty 'basicSettings.autoRun' $false -Force
-    return @{OldId=$OldId;NewId=$NewId;OldDirectory=$old;TargetDirectory=$target;TargetConfig=$targetConfig;SourceConfig=$sourceConfig;SourceVm=$sourceVm;OldData=$oldData;CopyData=$copyData;SourceSd=$sd;DataUuid=$dataUuid;SdUuid=$sdUuid;VmText=$xml.OuterXml;ConfigText=($configuration|ConvertTo-Json -Depth 30)}
+    return @{OldId=$OldId;NewId=$NewId;OldDirectory=$old;TargetDirectory=$target;TargetConfig=$targetConfig;SourceConfig=$sourceConfig;SourceVm=$sourceVm;OldData=$oldData;CopyData=$copyData;SourceSd=$sd;DataUuid=$dataUuid;SdUuid=$sdUuid;VmText=$xml.OuterXml;ConfigText=(($configuration|ConvertTo-Json -Depth 30) -replace ('(?i)leidian'+[regex]::Escape([string]$backupId)+'(?=[\\/.""\s]|$)'),('leidian'+$NewId))}
 }
 
 function Prepare-InstanceReplacementFiles {
@@ -3896,74 +3342,35 @@ function Assert-MovedInstanceSourceClosed {
 
 function Prepare-MovedInstanceReplacementFiles {
     param($Settings,$Journal,[string]$JournalPath)
-    $copying=$Journal.TransferMode -eq 'CopyDelete'
-    $vms=Join-Path $Settings.LdPlayerInstallPath 'vms'
-    $old=Join-Path $vms "leidian$($Journal.OldId)";$stage=$Journal.Stage
+    $vms=Join-Path $Settings.LdPlayerInstallPath 'vms';$stage=$Journal.Stage
     $expected=Join-Path $vms ".joiner-replacement-$($Journal.NewId)-$($Journal.Token)"
-    if($Journal.OldId -le 0 -or $Journal.NewId -le $Journal.OldId -or $Journal.Token -notmatch '^[a-f0-9]{32}$' -or [IO.Path]::GetFullPath($stage) -ine [IO.Path]::GetFullPath($expected)){throw 'Move journal does not match the exact source, target and staging paths.'}
-    foreach($path in @($old,$stage,(Join-Path $stage 'payload'))){Assert-InstanceReplacementDirectory $path $vms}
-    if($Journal.Phase -eq 'Preparing'){
-        $plan=New-InstanceReplacementPlan $Settings $Journal.OldId $Journal.NewId -TemplateData:($Journal.DataSource -eq 'Template0')
-        
-        foreach($entry in @{
-            SourceKind='AffectedInstance';SourceDataUuid=(Get-TemplateDiskDescriptor $plan.CopyData).Uuid;SourceSdUuid=(Get-TemplateDiskDescriptor $plan.SourceSd).Uuid
-            DataLength=(Get-Item -LiteralPath $plan.CopyData).Length;SdLength=(Get-Item -LiteralPath $plan.SourceSd).Length
-            PreparedVmText=$plan.VmText;PreparedConfigText=$plan.ConfigText;VmSourcePath=$plan.SourceVm
-        }.GetEnumerator()){$Journal|Add-Member NoteProperty $entry.Key $entry.Value -Force}
-        if($Journal.DataSource -eq 'Template0'){
-            $Journal|Add-Member NoteProperty TemplateDataPath $plan.CopyData -Force
-            $Journal|Add-Member NoteProperty TemplateDataWriteTicks (Get-Item -LiteralPath $plan.CopyData).LastWriteTimeUtc.Ticks -Force
-            $oldFile=Get-Item -LiteralPath $plan.OldData -ErrorAction SilentlyContinue
-            $Journal|Add-Member NoteProperty OldDataLength $(if($oldFile){$oldFile.Length}else{-1}) -Force
-            $Journal|Add-Member NoteProperty OldDataWriteTicks $(if($oldFile){$oldFile.LastWriteTimeUtc.Ticks}else{0}) -Force
-        }
-        if($copying){
-            $sourceFiles=foreach($path in @($plan.OldData,$plan.SourceSd,$plan.SourceVm,$plan.SourceConfig)){
-                if([IO.File]::Exists($path)){$item=Get-Item -LiteralPath $path;@{Path=$path;Length=$item.Length;Ticks=$item.LastWriteTimeUtc.Ticks}}
-            }
-            $Journal|Add-Member NoteProperty SourceFiles @($sourceFiles) -Force
-        }
-        $Journal.DataUuid=$plan.DataUuid;$Journal.SdUuid=$plan.SdUuid;$Journal.Phase=$(if($copying){'Copying'}else{'Moving'})
-        Write-TemplateStageManifest $JournalPath $Journal
-    }
-    if($Journal.Phase -notin @('Moving','Copying') -or -not $Journal.PreparedVmText -or -not $Journal.PreparedConfigText -or $Journal.DataLength -le 0 -or $Journal.SdLength -le 0){throw 'The replacement progress record is incomplete. Surviving files were left untouched.'}
+    if($Journal.OldId -le 0 -or $Journal.NewId -le $Journal.OldId -or $Journal.Token -notmatch '^[a-f0-9]{32}$' -or [IO.Path]::GetFullPath($stage) -ine [IO.Path]::GetFullPath($expected)){throw 'The replacement staging path does not match its journal.'}
+    Assert-InstanceReplacementDirectory $stage $vms
     Assert-MovedInstanceSourceClosed $Settings $Journal.OldId
-    $null=[IO.Directory]::CreateDirectory((Join-Path $stage 'payload'))
-    $files=@()
-    if($Journal.DataSource -eq 'Template0'){Copy-ReplacementTemplateData $Settings $Journal}
-    else{$files+=@{Source=(Join-Path $old 'data.vmdk');Target=(Join-Path $stage 'payload\data.vmdk');Length=$Journal.DataLength;OldUuid=$Journal.SourceDataUuid;NewUuid=$Journal.DataUuid}}
-    $files+=@(
-        @{Source=(Join-Path $old 'sdcard.vmdk');Target=(Join-Path $stage 'payload\sdcard.vmdk');Length=$Journal.SdLength;OldUuid=$Journal.SourceSdUuid;NewUuid=$Journal.SdUuid},
-        @{Source=$(if($Journal.VmSourcePath){$Journal.VmSourcePath}else{Join-Path $old 'leidian.vbox'});Target=(Join-Path $stage 'payload\leidian.vbox');Text=$Journal.PreparedVmText},
-        @{Source=(Join-Path $vms "config\leidian$($Journal.OldId).config");Target=(Join-Path $stage 'leidian.config');Text=$Journal.PreparedConfigText}
-    )
-    foreach($file in $files){
-        foreach($path in @($file.Source,$file.Target)){Assert-InstanceReplacementDirectory $path $vms}
-        if($copying){
-            if($file.ContainsKey('Length')){
-                Copy-ReplacementDiskFile $file.Source $file.Target $file.Length $file.OldUuid $file.NewUuid $vms
-            }else{
-                Write-ReplacementTextFile $file.Target $file.Text $vms
-            }
-            continue
-        }
-        $sourceExists=[IO.File]::Exists($file.Source);$targetExists=[IO.File]::Exists($file.Target)
-        if($sourceExists -and $targetExists){throw 'Both source and staged files exist for a move. Neither was overwritten.'}
-        if(-not $sourceExists -and -not $targetExists){throw 'A replacement file is missing from both its source and staging path. Recovery was postponed.'}
-        $current=if($sourceExists){$file.Source}else{$file.Target}
-        if($file.ContainsKey('Length')){
-            $uuid=(Get-TemplateDiskDescriptor $current).Uuid
-            if((Get-Item -LiteralPath $current).Length -ne $file.Length -or ($uuid -ine $file.OldUuid -and ($sourceExists -or $uuid -ine $file.NewUuid))){throw 'A disk does not match its recorded length or identity. No file was overwritten.'}
-        }
-        if($sourceExists){
-            Assert-MovedInstanceSourceClosed $Settings $Journal.OldId
-            
-            
-            [IO.File]::Move($file.Source,$file.Target)
-        }
+    if($Journal.Phase -eq 'Preparing'){
+        $plan=New-InstanceReplacementPlan $Settings $Journal.OldId $Journal.NewId
+        $backup=Get-DiskBackupEntry $Settings $Journal.OldId
+        foreach($entry in @{
+            SourceKind='AffectedInstance';DataSource='DiskBackup';TransferMode='CopyDelete';BackupDirectory=$backup.Directory
+            SourceDataUuid=(Get-TemplateDiskDescriptor $plan.CopyData).Uuid;SourceSdUuid=(Get-TemplateDiskDescriptor $plan.SourceSd).Uuid
+            DataLength=$backup.Manifest.Files.'data.vmdk'.Length;SdLength=$backup.Manifest.Files.'sdcard.vmdk'.Length
+            BackupDataHash=$backup.Manifest.Files.'data.vmdk'.Sha256;BackupSdHash=$backup.Manifest.Files.'sdcard.vmdk'.Sha256
+            PreparedVmText=$plan.VmText;PreparedConfigText=$plan.ConfigText;DataUuid=$plan.DataUuid;SdUuid=$plan.SdUuid
+        }.GetEnumerator()){$Journal|Add-Member NoteProperty $entry.Key $entry.Value -Force}
+        $Journal.Phase='Copying';Write-TemplateStageManifest $JournalPath $Journal
     }
-    Set-TemplateDiskHostUuid (Join-Path $stage 'payload\data.vmdk') $Journal.DataUuid
-    Set-TemplateDiskHostUuid (Join-Path $stage 'payload\sdcard.vmdk') $Journal.SdUuid
+    if($Journal.Phase -ne 'Copying' -or $Journal.DataSource -cne 'DiskBackup' -or -not $Journal.BackupDirectory){throw 'The replacement needs a verified disk-backup plan. Its existing files were kept.'}
+    $backup=Get-DiskBackupEntry $Settings $Journal.OldId
+    if(-not $backup -or [IO.Path]::GetFullPath($backup.Directory) -ine [IO.Path]::GetFullPath($Journal.BackupDirectory)){throw 'The reserved replacement backup is unavailable.'}
+    $null=[IO.Directory]::CreateDirectory((Join-Path $stage 'payload'))
+    foreach($disk in @(@('data.vmdk',$Journal.DataLength,$Journal.BackupDataHash,$Journal.SourceDataUuid,$Journal.DataUuid),@('sdcard.vmdk',$Journal.SdLength,$Journal.BackupSdHash,$Journal.SourceSdUuid,$Journal.SdUuid))){
+        $target=Join-Path $stage ('payload\'+$disk[0])
+        Copy-BackupReplacementDisk $Settings (Join-Path $backup.Directory $disk[0]) $target $disk[1] $disk[2] $disk[3] $disk[4]
+        Set-TemplateDiskHostUuid $target $disk[4]
+        $verified=Join-Path ([IO.Path]::GetDirectoryName($target)) ([IO.Path]::GetFileName($target)+'.verified.json')
+        $record=ConvertFrom-Json ([IO.File]::ReadAllText($verified));$item=Get-Item -LiteralPath $target
+        if($record.TargetTicks -ne $item.LastWriteTimeUtc.Ticks){Write-TemplateStageManifest $verified @{SourceHash=$disk[2];TargetHash=(Get-FileHash -LiteralPath $target).Hash;TargetTicks=$item.LastWriteTimeUtc.Ticks}}
+    }
     Write-ReplacementTextFile (Join-Path $stage 'payload\leidian.vbox') $Journal.PreparedVmText $vms
     Write-ReplacementTextFile (Join-Path $stage 'leidian.config') $Journal.PreparedConfigText $vms
     $Journal.Phase='Prepared';Write-TemplateStageManifest $JournalPath $Journal
@@ -4121,7 +3528,11 @@ function Install-InstanceReplacementFiles {
         if(-not (Test-ReplacementDiskFile $installed $disk[1] @($disk[3]))){
             $source=Join-Path $vms "leidian$($Journal.OldId)\$($disk[0])"
             if($disk[0] -eq 'data.vmdk' -and $Journal.DataSource -eq 'Template0'){$source=(Get-LauncherTemplateFiles $Settings).DataFile;$null=Resolve-LauncherRecoverySource $Settings -CheckClosed}
-            Copy-ReplacementDiskFile $source $installed $disk[1] $disk[2] $disk[3] $vms
+                        if($Journal.DataSource -eq 'DiskBackup'){
+                $source=Join-Path $Journal.BackupDirectory $disk[0]
+                $hash=if($disk[0] -eq 'data.vmdk'){$Journal.BackupDataHash}else{$Journal.BackupSdHash}
+                Copy-BackupReplacementDisk $Settings $source $installed $disk[1] $hash $disk[2] $disk[3]
+            }else{Copy-ReplacementDiskFile $source $installed $disk[1] $disk[2] $disk[3] $vms}
             Set-TemplateDiskHostUuid $installed $disk[3]
         }
     }
@@ -4186,7 +3597,7 @@ function Complete-InstanceReplacementMetadata {
     $Journal|Add-Member NoteProperty Version 2 -Force
     Set-InstanceReplacementStep $Journal $JournalPath 'Verifying installed files'
     Assert-InstalledInstanceReplacement $Settings $Journal -AllowRunning
-    Set-InstanceReplacementStep $Journal $JournalPath 'Verifying and renaming saved app data'
+    Set-InstanceReplacementStep $Journal $JournalPath 'Verifying and renaming the saved emulator backup'
     Move-GameAppDataIdentity $Settings $Journal
     $history[$newKey]=[int]$Journal.OldId
     Write-TemplateStageManifest $paths.History @{Version=1;Origins=$history}
@@ -4194,7 +3605,7 @@ function Complete-InstanceReplacementMetadata {
     $excluded=@($values.ExcludedLdPlayerIds -split ','|Where-Object{$_ -match '^\d+$'}|ForEach-Object{[int]$_})
     $excluded=@(@($excluded)+@([int]$Journal.OldId)|Where-Object{$_ -ne $Journal.NewId}|Sort-Object -Unique)
     Set-InstanceReplacementStep $Journal $JournalPath 'Removing verified old emulator files'
-    if($Journal.DataSource -eq 'Template0' -and -not $Journal.TargetRunningVerified){Initialize-ReplacementTemplateAccountCleanup $Settings $Journal}
+    
     if($Journal.DataSource -eq 'Template0'){Complete-TemplateDataReplacementCleanup $Settings $Journal $JournalPath}
     if($Journal.TransferMode -eq 'CopyDelete'){Complete-CopiedInstanceSourceCleanup $Settings $Journal $JournalPath}
     if($Journal.TransferMode -ne 'CopyDelete'){
@@ -4210,14 +3621,7 @@ function Complete-InstanceReplacementMetadata {
     Write-TemplateStageManifest $JournalPath $Journal
 }
 
-function Initialize-ReplacementTemplateAccountCleanup {
-    param($Settings,$Journal)
-    $marker=Join-Path $Settings.RestoreStateDirectory "template-accounts-$($Journal.NewId).json"
-    if([IO.File]::Exists($marker)){
-        $pending=ConvertFrom-Json ([IO.File]::ReadAllText($marker))
-        if($pending.Token -cne $Journal.Token -or $pending.TargetIndex -ne $Journal.NewId){throw 'A different copied-account cleanup already owns the new ID.'}
-    }else{Write-TemplateStageManifest $marker @{TargetIndex=$Journal.NewId;SourceIndex=0;Token=$Journal.Token;Packages=@($Settings.GamePackages);Cleared=@()}}
-}
+
 
 function Get-ReplacementSourceHostProcesses {
     param($Settings,[int]$OldId,$Previous=@(),$Inventory=$null)
@@ -4362,7 +3766,7 @@ function Invoke-InstanceReplacement {
         if($journal -and -not (Test-InstanceReplacementPending $journal) -and $script:ActiveInstanceReplacementToken -cne $journal.Token){$journal=$null}
         if(-not $journal){
             $newId=Get-NextInstanceReplacementId $Config;$token=[guid]::NewGuid().ToString('N')
-            $dataSource=if($FreshData -or $script:PendingEmulatorRestore){'Template0'}else{'AffectedInstance'}
+            $dataSource='DiskBackup'
             $journal=[pscustomobject]@{Version=2;Kind='InstanceReplacement';OldId=$oldId;NewId=$newId;Token=$token;Phase='Preparing';TransferMode='CopyDelete';DataSource=$dataSource;Stage=(Join-Path $Config.LdPlayerInstallPath "vms\.joiner-replacement-$newId-$token");DataUuid='';SdUuid=''}
             Write-TemplateStageManifest $journalPath $journal
         }
@@ -4512,11 +3916,11 @@ function Invoke-WorkerWithInstanceReplacement {
             $script:PendingInstanceReplacement=$false;$script:ActiveInstanceReplacementToken=$null;$script:PendingEmulatorRestore=$null
             Reset-AppCrashTracking
             $script:PackageCheckRestartPending=$false;Reset-PackageCheckRecovery
-            $script:CurrentEmulatorInstance=$null;$script:RequiredAppsCheckedKey=$null;$script:InitialCookieBoot=0;$script:CookieBootIdentity=0;$script:CookieAdbSerial=$null
-            $script:InitialCookieChecks=@{};$script:LoadedCookieCaptures=@{};$script:LoadedAppDataCaptures=@{};$script:WaitingAppDataCookies=@{};$script:GameCookiePassResults=@{};$script:CookieAuthenticationCache=@{};$script:CookieSlotPause=$null
+            $script:CurrentEmulatorInstance=$null;$script:RequiredAppsCheckedKey=$null;;$script:AppDataBootIdentity=0;$script:AppDataAdbSerial=$null
+            ;;$script:LoadedAppDataCaptures=@{};;;;
             $script:VpnVerifiedBoot=0;$script:CloudflareUidCache=$null;$script:EmulatorUptimeProcessId=0;$script:StartupFailureCount=0;$script:GameLinkSentAt=@{}
             Clear-ProcessCheckCache
-            Write-FlowStatus "This worker now handles replacement $InstanceIndex. Continuing the normal VPN, account and game flow."
+            Write-FlowStatus "This worker now handles replacement $InstanceIndex. Continuing PC presence, local readiness-marker and root-off startup."
         }catch{
             if($script:PoolRole){
                 $package=[string]$_.Exception.Data['GamePackage'];if(-not $package){$package=$script:PoolActivePackage}
@@ -4794,12 +4198,8 @@ function Complete-TemplateDiskStage {
 
 function Resolve-LauncherRecoverySource {
     param($Settings,[string]$Directory,[switch]$CheckClosed)
-    $template=Get-LauncherTemplateFiles $Settings
-    if($CheckClosed){
-        $inventory=Get-BootInventory $Settings
-        if(-not $inventory.ContainsKey(0) -or $inventory[0].ProcessId -gt 0 -or $inventory[0].AndroidStarted){throw 'LDPlayer 0 must be present and closed before using it as the template.'}
-    }
-    return $template.Root
+    if($Directory){return (Join-Path $Directory 'backup')}
+    return (Get-DiskBackupRoot $Settings)
 }
 
 function Get-LauncherTemplateFiles {
@@ -4853,67 +4253,7 @@ function Get-TemplateAccountResetPath {
 
 
 
-function Invoke-TemplateEmulatorRecovery {
-    if($InstanceIndex -eq $Config.RecoveryTemplateId){throw 'The reserved template cannot be a recovery target.'}
-    $null=Resolve-LauncherRecoverySource -Settings $Config -CheckClosed
-    $stage=Get-PendingTemplateStage
-    $target=Get-RestoreTargetInfo -Id $InstanceIndex
-    if($target.Running){
-        if(Test-EmulatorResponsive){
-            try{$null=Save-LoadedEmulatorAppData -BootIdentity $script:CookieBootIdentity -Force}catch{}
-            try{Close-AppsBeforeEmulatorRestart}catch{Write-FlowStatus 'App cleanup was unavailable; closing only the affected emulator.'}
-        }
-        $null=Invoke-Ld -Arguments @('quit','--index',"$InstanceIndex")
-    }
-    $deadline=[datetime]::UtcNow.AddSeconds([math]::Max(120,$Config.LdPlayerOpenTimeout));$stopped=0
-    while($stopped -lt 2){
-        if(Test-FlowStopRequested){throw [OperationCanceledException]::new('Stopped before data-disk recovery.')}
-        $current=Get-RestoreTargetInfo -Id $InstanceIndex
-        if($current.Name -cne $target.Name){throw 'Target identity changed; disk replacement postponed.'}
-        if($current.Running){$stopped=0}else{$stopped++}
-        if([datetime]::UtcNow -gt $deadline){throw 'The affected emulator did not finish closing. Its disk was not replaced.'}
-        if($stopped -lt 2){Start-Sleep -Seconds 1}
-    }
-    Enter-EmulatorLoadingSlot
-    try{
-        Enter-EmulatorRestoreSlot
-        $script:RestoreQueueRecord.Phase='Restoring'
-        Write-RestoreQueueRecord $script:RestoreQueuePath $script:RestoreQueueRecord
-        if(-not $stage){
-            Write-FlowStatus ('Preparing only data.vmdk from closed template '+$Config.RecoveryTemplateId+'...')
-            $plan=Get-TemplateDiskPlan $Config.LdPlayerInstallPath $Config.RecoveryTemplateId $InstanceIndex $target.Name
-            $stage=New-TemplateDiskStage $plan
-        }
-        $before={param($manifest)
-            if(Test-FlowStopRequested){throw [OperationCanceledException]::new('Stopped before disk replacement. The prepared disk was preserved.')}
-            if((Get-RestoreTargetInfo -Id $Config.RecoveryTemplateId).Running){throw 'Template was opened. Close it before disk recovery can continue.'}
-            $current=Get-RestoreTargetInfo -Id $InstanceIndex
-            if($current.Running -or $current.Name -cne $manifest.TargetName){throw 'Target started or changed. Disk replacement postponed.'}
-            $currentPlan=Get-TemplateDiskPlan $Config.LdPlayerInstallPath $Config.RecoveryTemplateId $InstanceIndex $current.Name
-            if($currentPlan.DataUuid -ine $manifest.DataUuid){throw 'Target disk registration changed. Its settings were left untouched.'}
-            if($manifest.Phase -eq 'Prepared' -and (Get-Item -LiteralPath (Join-Path $manifest.SourceDirectory 'data.vmdk')).LastWriteTimeUtc.Ticks -ne $manifest.SourceDataWriteTicks){throw 'Template changed after disk preparation. The target was kept unchanged.'}
-        }
-        $mark={param($manifest)
-            $path=Get-TemplateAccountResetPath
-            if(Test-Path -LiteralPath $path){
-                $existing=ConvertFrom-Json ([IO.File]::ReadAllText($path))
-                if($existing.Token -eq $manifest.Token){return}
-            }
-            Write-TemplateStageManifest $path @{TargetIndex=$InstanceIndex;SourceIndex=$Config.RecoveryTemplateId;Token=$manifest.Token;Packages=@($Config.GamePackages);Cleared=@()}
-        }
-        Write-FlowStatus 'Replacing only data.vmdk. Keeping this instance and all its other files and settings.'
-        Complete-TemplateDiskStage -Stage $stage -BeforeCommit $before -MarkAccountsPending $mark
-        Remove-TemplateStageDirectory $stage.Directory $stage.Manifest.TargetDirectory
-        $script:PendingEmulatorRestore=$null;$script:FlowTimeoutCounts=@{};$script:RequiredAppsCheckedKey=$null;$script:StartupFailureCount=0;$script:VpnVerifiedBoot=0;$script:CurrentEmulatorInstance=$null;$script:InitialCookieBoot=0;$script:InitialCookieChecks=@{};$script:CookieAuthenticationCache=@{};$script:CookieSlotPause=$null
-        Reset-PackageCheckRecovery
-        $script:LoadedCookieCaptures=@{};$script:LoadedAppDataCaptures=@{};$script:WaitingAppDataCookies=@{};$script:GameCookiePassResults=@{};$script:CookieAdbSerial=$null
-        Write-FlowStatus 'Data-disk replacement completed. Restarting the full cookie, VPN and game flow.'
-    }finally{Exit-EmulatorRestoreSlot}
-    if(Test-FlowStopRequested){throw [OperationCanceledException]::new('Stopped after data-disk replacement finished.')}
-    Start-Sleep -Seconds ([math]::Max(1,$Config.InstanceRelaunchDelay))
-    $script:RecoveringEmulator=$true
-    Invoke-SpacedEmulatorLaunch -Relaunch
-}
+
 
 function Resolve-LauncherRestoreBackup {
     param($Settings,[string]$Directory)
@@ -5067,43 +4407,24 @@ function Register-PackageCheckFailure {
 
 function Confirm-RequiredEmulatorApps {
     param([int]$BootIdentity)
-    if(-not $Config.RestoreBackupPath){return}
-    if($script:PendingInstanceReplacement -or $script:PackageCheckRestartPending){throw (New-PackageCheckRestartError)}
-    $required=@($CloudflarePackage)+@($Config.GamePackages)
+    Confirm-NoRootAdb -BootIdentity $BootIdentity
+    if($script:PendingInstanceReplacement){Request-NoRootReplacement 'An instance replacement is already pending.'}
+    $required=@($Config.GamePackages)
+    if(-not $script:NoRootMaintenance){$required=@($CloudflarePackage)+$required}
     $key="$BootIdentity|$($required -join ',')"
     if($script:RequiredAppsCheckedKey -ceq $key){return}
-    $limit=2;if($Config.PackageCheckFailuresBeforeRestart){$limit=$Config.PackageCheckFailuresBeforeRestart}
-    $delay=10;if($Config.PackageCheckRetryDelay){$delay=$Config.PackageCheckRetryDelay}
-    while($true){
-        if(Test-FlowStopRequested){throw [OperationCanceledException]::new('Stopped during package verification.')}
-        $attempt=1+[int]$script:PackageCheckFailureCount
-        Write-FlowStatus "Checking installed app packages ($attempt/$limit for this load): $($required -join ', ')"
-        $found=$false;$detail='Android did not return a complete package response; no missing app was assumed.'
-        $deadline=[datetime]::UtcNow.AddSeconds($Config.CommandTimeout)
-        try{
-            
-            
-            $paths=Get-RequiredPackagePaths -Packages $required -Deadline $deadline
-            if($null -ne $paths){
-                $found=$paths.Missing.Count -eq 0
-                if(-not $found){$detail='Required packages were not found: '+($paths.Missing -join ', ')}
-            }elseif($script:LastPackageCheckDetail){$detail=$script:LastPackageCheckDetail}
-        }catch [System.Management.Automation.PipelineStoppedException]{throw}
-        catch [OperationCanceledException]{throw}
-        catch{$detail='Package response unavailable: '+$_.Exception.Message}
-        if(Test-FlowStopRequested){throw [OperationCanceledException]::new('Stopped after reading package status; no recovery was queued.')}
-        if($found){
-            Reset-PackageCheckRecovery
-            $script:RequiredAppsCheckedKey=$key
-            Write-FlowStatus 'All required app packages are installed. This load will not be checked again.'
-            return
-        }
-        Write-FlowStatus $detail
-        
-        Register-PackageCheckFailure
-        Write-FlowStatus "Waiting $delay seconds before the next package check..."
-        Wait-FlowPause $delay
-    }
+    if(Test-FlowStopRequested){throw [OperationCanceledException]::new('Stopped during package verification.')}
+    Write-FlowStatus "Checking required packages once: $($required -join ', ')"
+    $paths=$null
+    try{$paths=Get-RequiredPackagePaths -Packages $required -Deadline ([datetime]::UtcNow.AddSeconds($Config.CommandTimeout))}
+    catch [System.Management.Automation.PipelineStoppedException]{throw}
+    catch [OperationCanceledException]{throw}
+    catch{Write-FlowStatus 'The package command did not return a usable response.'}
+    if(Test-FlowStopRequested){throw [OperationCanceledException]::new('Stopped after package verification; replacement was not queued.')}
+    if($null -eq $paths){Request-NoRootReplacement 'The single package check could not confirm the installed packages. No specific package was assumed missing.'}
+    if($paths.Missing.Count){Request-NoRootReplacement ('Required packages are missing: '+($paths.Missing -join ', '))}
+    Reset-PackageCheckRecovery;$script:RequiredAppsCheckedKey=$key
+    Write-FlowStatus 'All required packages are installed.'
 }
 
 function Invoke-PackageCheckRecovery {
@@ -5340,55 +4661,15 @@ function Write-LauncherConfigValues {
     } finally {if(Test-Path -LiteralPath $temporary){Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue}}
 }
 
-function Test-GameCookieOverwriteEnabled {
-    if ($Config.CookieOverwriteStatePath) {return (Test-Path -LiteralPath $Config.CookieOverwriteStatePath -PathType Leaf)}
-    return ($Config.OverwriteExistingCookies -eq 1)
-}
 
-function Initialize-CookieCheckTracking {
-    param($Settings,[string]$Directory)
-    $Settings.CookieCheckStateDirectory=$Directory
-    $Settings.CookieUiStateDirectory=$Directory
-    $Settings.CookieOverwriteStatePath=Join-Path $Directory 'cookie-overwrite.enabled'
-    if ($Settings.OverwriteExistingCookies -eq 1) {[IO.File]::WriteAllText($Settings.CookieOverwriteStatePath,'1')}
-}
 
-function Complete-InitialCookieChecks {
-    param([object[]]$Results)
-    if (-not $Config.CookieCheckStateDirectory -or $Results.Count -ne $Config.GamePackages.Count) {return}
-    if (@($Results|Where-Object{$null -eq $_ -or $_.Unavailable}).Count -gt 0) {return}
-    $path=Join-Path $Config.CookieCheckStateDirectory ("cookie-checked-$InstanceIndex.json")
-    if (-not (Test-Path -LiteralPath $path)) {
-        [IO.File]::WriteAllText($path,(@{InstanceId=$InstanceIndex;Packages=$Config.GamePackages;CheckedUtc=[datetime]::UtcNow.ToString('o')}|ConvertTo-Json -Compress))
-    }
-}
 
-function Update-CookieOverwriteTracking {
-    param($Settings)
-    if(-not $Settings.CookieCheckStateDirectory){return}
-    $checked=0
-    foreach($id in $Settings.LdPlayerIds){if(Test-Path -LiteralPath (Join-Path $Settings.CookieCheckStateDirectory "cookie-checked-$id.json")){$checked++}}
-    $path=Join-Path $Settings.CookieCheckStateDirectory 'cookie-check-progress.json'
-    $state=@{Checked=$checked;Total=$Settings.LdPlayerIds.Count;OverwriteEnabled=$false}|ConvertTo-Json -Compress
-    $current='';try{$current=[IO.File]::ReadAllText($path)}catch{}
-    if($current -cne $state){[IO.File]::WriteAllText($path,$state)}
-}
 
-function Publish-GameCookieUiState {
-    param($Result)
-    if (-not $Config.CookieUiStateDirectory) {return}
-    try {
-        $state='Checked'
-        if($Result.Mismatch){$state='Cookie mismatch'}
-        elseif($Result.Unavailable){$state='Check unavailable'}
-        elseif($Result.NeedsLogin){$state='Waiting for cookie'}
-        elseif($Result.Ready){$state='Cookies match'}
-        $appCookie='Unknown'; if($null -ne $Result.AppCookiePresent){$appCookie=if($Result.AppCookiePresent){'Saved'}else{'Blank'}}
-        $payload=@{InstanceId=$InstanceIndex;Package=$Config.GamePackage;Status=$state;AppCookie=$appCookie;Message=$Result.Message;Utc=[datetime]::UtcNow.ToString('o')}
-        $path=Join-Path $Config.CookieUiStateDirectory ("ui-cookie-$InstanceIndex-$($Config.GamePackage).json")
-        [IO.File]::WriteAllText($path,($payload|ConvertTo-Json -Compress))
-    } catch { }
-}
+
+
+
+
+
 
 function Test-FlowStopRequested {
     $path=$env:LAUNCHER_FLOW_STOP_FILE
@@ -5401,9 +4682,6 @@ function Test-FlowStopRequested {
 
 
 
-function Start-GameCookieCheckPass {
-    $script:GameCookiePassId=1+[long]$script:GameCookiePassId
-}
 
 
 
@@ -5411,68 +4689,19 @@ function Start-GameCookieCheckPass {
 
 
 
-function Stop-GameAppForAccountUpdate {
-    param([string]$Package)
-    if(-not (Test-AppRunning -Package $Package)){return}
-    if(-not (Test-EmulatorResponsive)){
-        $failure=[TimeoutException]::new('Android is not responding during account initialization. Restarting the emulator before retrying.')
-        $failure.Data['CookieEmulatorRestartRequired']=$true;throw $failure
-    }
-    $null=Invoke-Ld -Arguments @('killapp','--index',"$InstanceIndex",'--packagename',$Package)
-    if(Test-AppRunning -Package $Package){throw 'Waiting for the app to close before updating its cookie and profile.'}
-    Clear-GameHomeLinkTimer
-}
 
 
 
 
-function Get-WaitingCookiePresence {
-    param([string]$Package,$InstanceInfo=$null)
-    $entries=$null;$snapshot=$null
-    try{
-        $entries=Read-GameCookieStore
-        $localPresent=$entries.ContainsKey([string]$InstanceIndex) -and $entries[[string]$InstanceIndex].ContainsKey($Package) -and
-            [bool](ConvertTo-GameCookieValue $entries[[string]$InstanceIndex][$Package])
-        if($localPresent){return [pscustomobject]@{Known=$true;Available=$true;BothMissing=$false;Reason=''}}
-        if($null -eq $InstanceInfo){$InstanceInfo=Get-InstanceInfo -Id $InstanceIndex}
-        if($null -eq $InstanceInfo -or $InstanceInfo.ProcessId -le 0 -or -not $InstanceInfo.AndroidStarted){
-            return [pscustomobject]@{Known=$false;Available=$false;BothMissing=$false;Reason='The emulator is not ready; waiting for a saved cookie or a manual start.'}
-        }
-        if(-not $script:CookieAdbSerial -or $script:CookieAdbBoot -ne $InstanceInfo.ProcessId){
-            $serial=(Invoke-Ld -Arguments @('adb','--index',"$InstanceIndex",'--command','get-serialno')).Trim()
-            if($serial -notmatch '^(emulator-\d+|(?:127\.0\.0\.1|localhost):\d+)$'){throw 'The emulator ADB identity is unavailable.'}
-            $script:CookieAdbSerial=$serial;$script:CookieAdbBoot=$InstanceInfo.ProcessId
-        }
-        $snapshot=Get-GameCookieSnapshot -Package $Package
-        $appPresent=[bool]($snapshot.Value -or $snapshot.Encrypted)
-        return [pscustomobject]@{Known=$true;Available=$appPresent;BothMissing=(-not $appPresent);Reason=''}
-    }catch [System.Management.Automation.PipelineStoppedException]{throw}
-    catch [OperationCanceledException]{throw}
-    catch{return [pscustomobject]@{Known=$false;Available=$false;BothMissing=$false;Reason=$_.Exception.Message}}
-    finally{$entries=$null;$snapshot=$null}
-}
 
-function Suspend-SetupSlotForCookie {
-    param([string]$Package)
-    if($script:CookieSlotPause){return}
-    $script:CookieSlotPause=[pscustomobject]@{Package=$Package;NextCheckAt=[datetime]::UtcNow.AddSeconds([math]::Max(1,$Config.GameCheckInterval));LastMessage=''}
-    Set-BootRequestPhase WaitingForCookie
-    Write-FlowStatus "Both cookie locations are empty for $Package. Released the emulator setup slot; keeping the app open at login. Checking for a cookie at $($Config.GameCheckInterval)-second intervals."
-}
 
-function Suspend-SetupSlotForUnresolvedMismatch {
-    param([string]$Package)
-    if($script:CookieSlotPause){return}
-    $script:CookieSlotPause=[pscustomobject]@{Package=$Package;Kind='Mismatch';NextCheckAt=[datetime]::UtcNow;LastMessage=''}
-    Set-BootRequestPhase WaitingForCookie
-    Write-FlowStatus "The cookie for $Package is encrypted and cannot be copied while overwrite is OFF. Released the loading slot; rechecking at the normal game-check interval."
-}
 
-function Resume-SetupSlotWhenCookieAppears {
-    param($InstanceInfo=$null)
-    $script:CookieSlotPause=$null
-    return $true
-}
+
+
+
+
+
+
 
 
 
@@ -5488,111 +4717,9 @@ function Wait-NextGameCheck {
     return [Diagnostics.Stopwatch]::GetTimestamp()
 }
 
-function Watch-LauncherSession {
-    Write-FlowStatus "Watching game status at $($Config.GameCheckInterval)-second intervals. Ctrl+C stops the script."
-    $disconnectReads=0; $homeReads=0; $unknownReads=0
-    $previousState=''; $passStarted=0
-    while ($true) {
-        $passStarted=Wait-NextGameCheck -PreviousPassStarted $passStarted
-        Start-GameCookieCheckPass
-        try {
-            $instance=Get-InstanceInfo -Id $InstanceIndex
-            if ($null -eq $instance -or $instance.ProcessId -le 0) { return 'EmulatorClosed' }
-            if (Invoke-ScheduledEmulatorRestart -InstanceInfo $instance) { return 'ScheduledRestart' }
-            if (-not (Test-EmulatorResponsive -InstanceInfo $instance)) { return 'EmulatorNotResponding' }
-            $script:CookieBootIdentity=$instance.ProcessId
-            Confirm-RequiredEmulatorApps -BootIdentity $instance.ProcessId
-            Assert-MonitoredAppVisible
-            $state=Get-LauncherSessionState
-            if($state -eq 'Minimized'){return 'AppMinimized'}
-            if ($state -eq 'Crashed') { return 'AppCrashed' }
-            if ($state -eq 'Unknown' -and -not (Test-AppRunning -Package $Config.GamePackage)) { return 'LauncherClosed' }
-        }
-        catch [System.Management.Automation.PipelineStoppedException] { throw }
-        catch [OperationCanceledException] { throw }
-        catch {
-            if ($_.Exception.Data['PackageCheckUnavailable']) {
-                if((Invoke-PackageCheckRecovery -Failure $_.Exception) -eq 'EmulatorReopened'){return 'PackageCheckRetry'}
-                continue
-            }
-            if ($_.Exception.Data['GameStatusReadFailed']) {
-                Write-FlowStatus ('Game status unavailable. Keeping the app open and retrying. '+$_.Exception.Message)
-                $disconnectReads=0; $homeReads=0
-                continue
-            }
-            Write-FlowStatus ('Status check failed: '+$_.Exception.Message)
-            return 'UnexpectedError'
-        }
-        if ($state -eq 'Blocked') {
-            if ($previousState -ne 'Blocked') { Write-FlowStatus 'Waiting for the account/access/kick error to clear.' }
-            $disconnectReads=0; $homeReads=0; $unknownReads=0; $previousState=$state
-            continue
-        }
-        if ($state -eq 'Disconnected') { $disconnectReads++ } else { $disconnectReads=0 }
-        if ($disconnectReads -ge 2) { return 'Disconnected' }
-        if ($state -eq 'Home') { $homeReads++ } else { $homeReads=0 }
-        if ($homeReads -ge 2) { return 'Home' }
-        if ($state -eq 'Unknown') {
-            $unknownReads++
-            if ($unknownReads -eq 1) { Write-FlowStatus 'Status is unavailable, but the app is still running. Leaving its session untouched.' }
-        } else { $unknownReads=0 }
-        if ($state -ne $previousState) { Write-FlowStatus "Game status: $state" }
-        $previousState=$state
-    }
-}
 
-function Invoke-ContinuousEmulatorFlow {
-    $script:RecoveringEmulator=$false
-    $disconnectConfirmed=$false
-    while ($true) {
-        Start-GameCookieCheckPass
-        $reason='UnexpectedError'
-        try {
-            if ($disconnectConfirmed) {
-                Invoke-Ld -Arguments @('killapp','--index',"$InstanceIndex",'--packagename',$Config.GamePackage) | Out-Null
-            }
-            $action=Invoke-EmulatorFlow -DisconnectConfirmed:$disconnectConfirmed
-            if ($action -eq 'WaitingForCookie') { Start-Sleep -Seconds $Config.GameCheckInterval; continue }
-            if ($script:BootRequestRecord.Phase -eq 'SettingUp') {
-                Wait-LauncherInGame
-                Set-BootRequestPhase Finished
-                Write-FlowStatus 'Game app is fully in game. Released the emulator setup slot.'
-            }
-            $script:RecoveringEmulator=$false
-            $disconnectConfirmed=$false
-            if ($Config.MonitorGame -eq 0) { return $action }
-            $reason=Watch-LauncherSession
-        }
-        catch [System.Management.Automation.PipelineStoppedException] { throw }
-        catch [OperationCanceledException] { throw }
-        catch {
-            if ($Config.MonitorGame -eq 0) { throw }
-            if ($_.Exception.Data['PackageCheckUnavailable']) {
-                $null=Invoke-PackageCheckRecovery -Failure $_.Exception
-                Start-Sleep -Seconds ([math]::Max(1,$Config.GameCheckInterval))
-                continue
-            }
-            if ($_.Exception.Data['GameStatusReadFailed']) {
-                Write-FlowStatus ('Game status unavailable. Keeping the app open and retrying. '+$_.Exception.Message)
-                $disconnectConfirmed=$false
-                Start-Sleep -Seconds ([math]::Max(1,$Config.GameCheckInterval))
-                continue
-            }
-            Write-FlowStatus ('Unexpected error: '+$_.Exception.Message)
-        }
-        if ($reason -eq 'Disconnected') {
-            $disconnectConfirmed=$true
-        }
-        elseif ($reason -notin @('Home','LauncherClosed','ScheduledRestart','CookieChanged','PackageCheckRetry','AppMinimized')) {
-            try { $null=Restart-AfterUnexpectedError }
-            catch [System.Management.Automation.PipelineStoppedException] { throw }
-            catch [OperationCanceledException] { throw }
-            catch { Write-FlowStatus ('Recovery will retry: '+$_.Exception.Message) }
-        }
-        Clear-ProcessCheckCache
-        Start-Sleep -Seconds ([math]::Max(1,$Config.RetryDelay))
-    }
-}
+
+
 
 function Wait-LauncherInGame {
     Write-FlowStatus "Waiting up to $($Config.GameJoinTimeout) seconds to enter the game before continuing..."
@@ -5670,355 +4797,128 @@ function Request-MonitorQuickRecovery {
     return $true
 }
 
-function Invoke-MultipleGameApps {
-    $baseConfig=$Config
-    $apps=New-Object 'System.Collections.Generic.List[object]'
-    foreach ($package in $baseConfig.GamePackages) {
-        $appConfig=$baseConfig.Clone()
-        $appConfig.GamePackage=$package
-        $appConfig.LauncherPackage=$package
-        $appConfig.ServerLink=$baseConfig.ServerLink
-        
-        if ($appConfig.MaxServerLinkAttempts -eq 0) { $appConfig.MaxServerLinkAttempts=1 }
-        $apps.Add([pscustomobject]@{Config=$appConfig;Ready=$false;Disconnected=0;Home=0;Unknown=0;Confirmed=$false;LastState='';CookieResult=$null})
-    }
-    $lastProcessId=0
-    $passStarted=0
-    $watchAnnounced=$false
-    if($script:PoolRole -and $script:PoolAppState){
-        $apps=$script:PoolAppState.Apps
-        $lastProcessId=$script:PoolAppState.LastProcessId
-        $watchAnnounced=$script:PoolAppState.WatchAnnounced
-        foreach($app in $apps){$app.Config.LdPlayerIds=@($baseConfig.LdPlayerIds)}
-    }
-    $poolPassRan=$false
-    try {
-        while ($true) {
-            if($script:PoolRole -eq 'Monitor' -and $poolPassRan){return 'Monitoring'}
-            if($script:PoolRole -eq 'Setup' -and $poolPassRan -and $script:CookieSlotPause){return 'WaitingForCookie'}
-            $poolPassRan=$true
-            if ($script:PoolRole -ne 'Monitor' -and $passStarted -gt 0 -and -not $script:ImmediateFlowRetry) { $passStarted=Wait-NextGameCheck -PreviousPassStarted $passStarted }
-            else { $passStarted=[Diagnostics.Stopwatch]::GetTimestamp() }
-            $script:ImmediateFlowRetry=$false
-            Start-GameCookieCheckPass
-            $monitorCookieBatch=$null
-            $Config=$apps[0].Config
-            $activeApp=$apps[0]
-            try {
-                if($script:PoolRole -eq 'Setup' -and $script:PoolPendingRecovery){
-                    $pending=$script:PoolPendingRecovery
-                    $activeApp=@($apps|Where-Object{$_.Config.GamePackage -ceq $pending.Package})|Select-Object -First 1
-                    if(-not $activeApp){$activeApp=$apps[0]}
-                    $Config=$activeApp.Config
-                    $needsRecovery=$true
-                    if($pending.CloseRequested -and -not $script:AppCrashRestartPending){
-                        
-                        
-                        $needsRecovery=$false;$activeApp.Ready=$false
-                        if($pending.CloseRequested -eq 'Emulator'){
-                            $current=Get-InstanceInfo -Id $InstanceIndex
-                            if($current -and $current.ProcessId -gt 0 -and -not (Test-EmulatorResponsive -InstanceInfo $current)){$needsRecovery=$true}
-                            foreach($item in $apps){$item.Ready=$false;$item.Confirmed=$false};$lastProcessId=0
-                        }
-                    }
-                    if($needsRecovery -and (-not $pending.HealthOnly -or -not (Test-EmulatorResponsive))){
-                        $recovery=Restart-AfterUnexpectedError -EmulatorOnly:($pending.EmulatorOnly -or $pending.HealthOnly)
-                        $activeApp.Ready=$false
-                        if($recovery -eq 'EmulatorReopened'){foreach($item in $apps){$item.Ready=$false;$item.Confirmed=$false};$lastProcessId=0}
-                    }elseif($pending.HealthOnly -and @($apps|Where-Object{-not $_.Ready}).Count -eq 0){
-                        $script:PoolPendingRecovery=$null;Set-BootRequestPhase Finished
-                        return 'Monitoring'
-                    }
-                    $script:PoolPendingRecovery=$null
-                    $Config=$apps[0].Config;$activeApp=$apps[0]
-                }
-                if($script:PoolRole -ne 'Monitor' -and $Config.RecoveryMode -eq 'Template' -and -not $script:PendingEmulatorRestore){
-                    if(Get-PendingTemplateStage){$script:PendingEmulatorRestore='Resuming the recorded data-disk replacement.'}
-                }
-                if($script:PendingEmulatorRestore){Assert-PoolSetupTurn;Invoke-PendingEmulatorRestore;foreach($app in $apps){$app.Ready=$false;$app.Confirmed=$false};$lastProcessId=0}
-                $script:RecoveryScope='Startup'
-                $instance=Get-InstanceInfo -Id $InstanceIndex
-                $script:CurrentEmulatorInstance=$instance
-                if ($null -eq $instance) {
-                    Set-EmulatorLiveObservation -EmulatorState Unknown
-                    $failure=New-GameStatusReadError "LDPlayer $InstanceIndex inventory was unavailable. Existing apps were left open."
-                    $failure.Data['InstanceInventoryUnavailable']=$true
-                    throw $failure
-                }
-                $displayBoot=if($instance.ProcessId -le 0){'Offline'}elseif(-not $instance.AndroidStarted){'Starting'}else{'Running'}
-                Set-EmulatorLiveObservation -EmulatorState $displayBoot -ResetApps:($lastProcessId -gt 0 -and $instance.ProcessId -ne $lastProcessId)
-                $cookieSlotStillPaused=$false
-                if($script:CookieSlotPause){
-                    $cookieSlotStillPaused=-not (Resume-SetupSlotWhenCookieAppears -InstanceInfo $instance)
-                    if($cookieSlotStillPaused -and ($instance.ProcessId -le 0 -or -not $instance.AndroidStarted)){continue}
-                }
-                if (-not $cookieSlotStillPaused -and $baseConfig.CookieStorePath -and $instance.ProcessId -gt 0 -and $instance.AndroidStarted -and $script:InitialCookieBoot -ne $instance.ProcessId) {
-                    Assert-PoolSetupTurn
-                    $script:CookieBootIdentity=$instance.ProcessId
-                    Confirm-RequiredEmulatorApps -BootIdentity $instance.ProcessId
-                    if (-not (Save-LoadedEmulatorAppData -BootIdentity $instance.ProcessId)) {
-                        if (-not (Test-EmulatorResponsive -InstanceInfo $instance)) { throw [TimeoutException]::new('Emulator stopped responding during initial game-data capture.') }
-                        continue
-                    }
-                }
-                if(-not $cookieSlotStillPaused -and $script:PoolRole -eq 'Monitor' -and (Test-PoolScheduledRestartDue $instance)){Assert-PoolSetupTurn}
-                if (-not $cookieSlotStillPaused -and $script:PoolRole -ne 'Monitor' -and (Invoke-ScheduledEmulatorRestart -InstanceInfo $instance)) {
-                    foreach ($app in $apps) { $app.Ready=$false;$app.Confirmed=$false }
-                    $lastProcessId=0
-                    $instance=Get-InstanceInfo -Id $InstanceIndex
-                }
-                if ($instance.ProcessId -le 0) {
-                    foreach ($app in $apps) { $app.Ready=$false; $app.Confirmed=$false }
-                    Start-SelectedEmulator
-                    $instance=Get-InstanceInfo -Id $InstanceIndex
-                }
-                if ($lastProcessId -gt 0 -and $instance.ProcessId -ne $lastProcessId) {
-                    foreach ($app in $apps) { $app.Ready=$false; $app.Confirmed=$false }
-                }
-                $lastProcessId=$instance.ProcessId
 
-                if (-not $cookieSlotStillPaused -and $baseConfig.CookieStorePath -and ($script:InitialCookieBoot -ne $instance.ProcessId -or -not $instance.AndroidStarted)) {
-                    Assert-PoolSetupTurn
-                    if (-not $instance.AndroidStarted) { Start-SelectedEmulator; $instance=Get-InstanceInfo -Id $InstanceIndex }
-                    $script:CookieBootIdentity=$instance.ProcessId
-                    Enter-EmulatorLoadingSlot
-                    Ensure-SessionVpn
-                    
-                    foreach ($app in $apps) {
-                        $activeApp=$app;$Config=$app.Config
-                        $app.CookieResult=Get-SetupGameAppData
-                        if ($app.CookieResult.Changed -or $app.CookieResult.NeedsLogin) { $app.Ready=$false; $app.Confirmed=$false }
-                    }
-                    Complete-InitialCookieChecks -Results @($apps | ForEach-Object {$_.CookieResult})
-                    $script:InitialCookieBoot=$instance.ProcessId
-                }
-                $script:RecoveryScope='Game'
-                
-                foreach ($app in $apps) {
-                    $activeApp=$app; $Config=$app.Config
-                    if($script:PoolRole){$script:PoolActivePackage=$Config.GamePackage}
-
-                    $dataTurn=Invoke-WaitingGameAppDataTurn
-                    $app|Add-Member NoteProperty DataLoginWaiting ($dataTurn -eq 'Waiting') -Force
-                    if($dataTurn -eq 'Waiting'){Set-EmulatorLiveObservation -AppState Login -Package $Config.GamePackage;$app.Ready=$true;$app.Confirmed=$false;continue}
-                    if($dataTurn -eq 'Captured'){$app.Ready=$false;$app.Confirmed=$false}
-
-                    if ($app.Ready) {
-                        Assert-MonitoredAppVisible
-                        $state=Get-LauncherSessionState
-                        if ($state -eq 'Crashed') { throw (New-AppCrashError $Config.GamePackage) }
-                        if ($state -ne $app.LastState) { Write-FlowStatus "Game status: $state"; $app.LastState=$state }
-                        if ($state -eq 'Blocked') { throw 'The game reported an account/access/kick error.' }
-                        if ($state -eq 'Disconnected') {$app.Disconnected++} else {$app.Disconnected=0}
-                        if ($state -eq 'Home') {$app.Home++} else {$app.Home=0}
-                        if ($state -in @('Minimized','Closed')) {
-                            
-                            
-                            
-                            $failure=[InvalidOperationException]::new("Android confirmed $($Config.GamePackage) is $($state.ToLowerInvariant()). Checking Android before app/emulator recovery.")
-                            if($state -eq 'Closed'){$failure.Data['AppAlreadyClosed']=$true}
-                            throw $failure
-                        }
-                        if ($state -eq 'Unknown') {
-                            $app.Unknown++
-                            if ($app.Unknown -eq 1) {Write-FlowStatus 'Game status is unavailable. Keeping this app open and checking again later.'}
-                        } else {$app.Unknown=0}
-                        if($script:PoolRole -and $state -in @('Joining','Loading')){
-                            if(-not $app.MonitorLoadingSince){$app|Add-Member NoteProperty MonitorLoadingSince ([datetime]::UtcNow) -Force}
-                            if(([datetime]::UtcNow-$app.MonitorLoadingSince).TotalSeconds -ge $Config.GameJoinTimeout){throw [TimeoutException]::new('The game remained loading past the configured join timeout. Queuing the affected app for recovery.')}
-                        }elseif($script:PoolRole){$app|Add-Member NoteProperty MonitorLoadingSince $null -Force}
-                        if ($app.Disconnected -ge 2) {
-                            if($script:PoolRole -eq 'Monitor'){
-                                $app.Ready=$false;$app.Confirmed=$true
-                                $null=Request-MonitorQuickRecovery -Package $Config.GamePackage
-                                Assert-PoolSetupTurn
-                            }
-                            if(-not (Test-EmulatorResponsive)){
-                                $failure=[InvalidOperationException]::new('Game disconnect confirmed and Android is not responding. Restarting this emulator.')
-                                $failure.Data['DisconnectedEmulatorUnresponsive']=$true
-                                throw $failure
-                            }
-                            $app.Ready=$false
-                            $app.Confirmed=$true
-                            Write-FlowStatus 'Network disconnect confirmed. Closing the game app before queuing its recovery.'
-                            Invoke-Ld -Arguments @('killapp','--index',"$InstanceIndex",'--packagename',$Config.GamePackage) | Out-Null
-                        }
-                        if ($app.Home -ge 2) {
-                            $app.Ready=$false
-                            if($script:PoolRole -eq 'Monitor'){$null=Request-MonitorQuickRecovery -Package $Config.GamePackage;Assert-PoolSetupTurn}
-                        }
-                    }
-                    $null=Invoke-RegularGameAppCookieTurn -Batch ([ref]$monitorCookieBatch)
-                    if (-not $app.Ready) {
-                        if($script:CookieSlotPause){continue}
-                        Assert-PoolSetupTurn
-                        $action=Invoke-EmulatorFlow -DisconnectConfirmed:$app.Confirmed
-                        if ($action -eq 'WaitingForCookie') { break }
-                        
-                        
-                        Wait-LauncherInGame
-                        $app.Ready=$true;$app.Confirmed=$false
-                        $app.Disconnected=0;$app.Home=0;$app.Unknown=0;$app.LastState=''
-                        Write-FlowStatus "Setup completed: $action"
-                    }
-                }
-                if ($script:BootRequestRecord.Phase -eq 'SettingUp') {
-                    
-                    
-                    $allJoined=$true
-                    foreach ($app in $apps) {
-                        $Config=$app.Config
-                        $activeApp=$app
-                        if($script:PoolRole){$script:PoolActivePackage=$Config.GamePackage}
-                        if($app.DataLoginWaiting){continue}
-                        if (-not $app.Ready -or (Get-LauncherSessionState -RequireReady) -ne 'InGame') {
-                            $allJoined=$false
-                            break
-                        }
-                    }
-                    if (-not $allJoined) { continue }
-                    Set-BootRequestPhase Finished
-                    if(@($apps|Where-Object{$_.DataLoginWaiting}).Count){Write-FlowStatus 'Active game apps are joined; apps without cookies are open for login. Released the emulator setup slot while waiting for cookies.'}
-                    else{Write-FlowStatus 'All game apps are fully in game. Released the emulator setup slot.'}
-                }
-                if ($baseConfig.MonitorGame -eq 0) { if($script:CookieSlotPause){return 'WaitingForCookie'};return 'AppsReady' }
-                if($script:PoolRole -eq 'Setup'){
-                    if($script:CookieSlotPause){return 'WaitingForCookie'}
-                    if(@($apps|Where-Object{-not $_.Ready}).Count -eq 0 -and $script:BootRequestRecord.Phase -eq 'Finished'){return 'Monitoring'}
-                }
-                if (-not $watchAnnounced) {
-                    Write-FlowStatus "Watching $($apps.Count) game app(s) at $($baseConfig.GameCheckInterval)-second intervals. Ctrl+C stops the script."
-                    $watchAnnounced=$true
-                }
-            }
-            catch [System.Management.Automation.PipelineStoppedException] { throw }
-            catch [OperationCanceledException] { throw }
-            catch {
-                if(-not $_.Exception.Data['GamePackage']){$_.Exception.Data['GamePackage']=[string]$Config.GamePackage}
-                if ($baseConfig.MonitorGame -eq 0) { throw }
-                if ($_.Exception.Data['PackageCheckUnavailable']) {
-                    $script:ImmediateFlowRetry=$true
-                    if((Invoke-PackageCheckRecovery -Failure $_.Exception) -eq 'EmulatorReopened'){
-                        foreach($app in $apps){$app.Ready=$false;$app.Confirmed=$false}
-                        $lastProcessId=0
-                    }
-                    continue
-                }
-                if ($_.Exception.Data['GameStatusReadFailed']) {
-                    Set-EmulatorLiveObservation -AppState Unknown -Package $Config.GamePackage
-                    if($script:PoolRole -eq 'Monitor'){
-                        if($_.Exception.Data['AppCacheCleanupFailed']){Write-FlowStatus $_.Exception.Message}
-                        else{Write-FlowStatus ('Game status unavailable. Keeping the app open and retrying. '+$_.Exception.Message)}
-                        $activeApp.Disconnected=0;$activeApp.Home=0
-                        if($_.Exception.Data['InstanceInventoryUnavailable']){continue}
-                        if(Request-MonitorQuickRecovery -Package $Config.GamePackage -Failure $_.Exception -HealthOnly){Assert-PoolSetupTurn}
-                        continue
-                    }
-                    if(-not $_.Exception.Data['InstanceInventoryUnavailable'] -and -not (Test-EmulatorResponsive)){
-                        Write-FlowStatus 'Game status failed and Android is not responding. Restarting this emulator.'
-                        $null=Restart-AfterUnexpectedError -EmulatorOnly
-                        foreach($item in $apps){$item.Ready=$false;$item.Confirmed=$false}
-                        $lastProcessId=0;$script:ImmediateFlowRetry=$true
-                        if($script:PoolRole -eq 'Monitor'){Assert-PoolSetupTurn}
-                    }else{
-                        if($_.Exception.Data['AppCacheCleanupFailed']){
-                            Write-FlowStatus $_.Exception.Message
-                        }elseif($_.Exception.Data['AppPresenceUnavailable']){
-                            Write-FlowStatus ('App presence could not be confirmed. Retrying the presence check before opening or changing this app. '+$_.Exception.Message)
-                        }else{
-                            Write-FlowStatus ('Game status unavailable. Keeping the app open and retrying. '+$_.Exception.Message)
-                        }
-                    }
-                    $activeApp.Disconnected=0;$activeApp.Home=0
-                    continue
-                }
-                $message=$_.Exception.Message
-                Write-FlowStatus ('App check failed: '+$message)
-
-                $activeApp.Ready=$false
-                $script:ImmediateFlowRetry=$true
-                if($script:PoolRole -eq 'Monitor'){
-                    $null=Request-MonitorQuickRecovery -Package $Config.GamePackage -Failure $_.Exception -EmulatorOnly:($script:RecoveryScope -in @('Startup','Packages','VPN') -or [bool]$_.Exception.Data['CookieEmulatorRestartRequired'])
-                    Assert-PoolSetupTurn
-                }
-                try {
-                    if($script:RecoveryScope -eq 'VPN' -and -not $script:PendingEmulatorRestore -and (Test-EmulatorResponsive)){
-                        Write-FlowStatus 'VPN setup will retry. The game apps were left untouched.'
-                        continue
-                    }
-                    $recovery=Restart-AfterUnexpectedError -EmulatorOnly:($script:RecoveryScope -in @('Startup','Packages','VPN') -or $_.Exception.Data['CookieEmulatorRestartRequired'] -or $_.Exception.Data['DisconnectedEmulatorUnresponsive'])
-                    if ($recovery -eq 'EmulatorReopened') {
-                        foreach ($item in $apps) {$item.Ready=$false;$item.Confirmed=$false}
-                        $lastProcessId=0
-                    }
-                }
-                catch [System.Management.Automation.PipelineStoppedException] { throw }
-                catch [OperationCanceledException] { throw }
-                catch { Write-FlowStatus ('Recovery will retry: '+$_.Exception.Message) }
-                if($script:PoolRole -eq 'Monitor'){Assert-PoolSetupTurn}
-                Start-Sleep -Seconds ([math]::Max(1,$baseConfig.RetryDelay))
-            }
-        }
-    }
-    finally {
-        if($script:PoolRole){$script:PoolAppState=@{Apps=$apps;LastProcessId=$lastProcessId;WatchAnnounced=$watchAnnounced}}
-        $Config=$baseConfig
-    }
-}
 
 function Invoke-ResilientEmulatorFlow {
-    $Config.MonitorGame=1
-    while ($true) {
-        try {
-            if($script:PoolRole -ne 'Monitor' -and $Config.RecoveryMode -eq 'Template' -and -not $script:PendingEmulatorRestore){
-                if(Get-PendingTemplateStage){$script:PendingEmulatorRestore='Resuming the recorded data-disk replacement.'}
-            }
-            if($script:PendingEmulatorRestore){Assert-PoolSetupTurn;Invoke-PendingEmulatorRestore}
-            if($script:PoolRole -ne 'Monitor'){Save-StartupLogSnapshot}
-            $action=Invoke-MultipleGameApps
-            if($script:PoolRole){return $action}
-            
-            Start-Sleep -Seconds ([math]::Max(1,$Config.RetryDelay))
-        }
-        catch [System.Management.Automation.PipelineStoppedException] { throw }
-        catch [OperationCanceledException] { throw }
-        catch {
-            if ($_.Exception.Data['PackageCheckUnavailable']) {
-                $null=Invoke-PackageCheckRecovery -Failure $_.Exception
-                Start-Sleep -Seconds ([math]::Max(1,$Config.RetryDelay))
-                continue
-            }
-            
-            
-            if($script:PoolRole -eq 'Monitor'){
-                $package=[string]$_.Exception.Data['GamePackage'];if(-not $package){$package=$script:PoolActivePackage};if(-not $package){$package=$Config.GamePackage}
-                $healthOnly=[bool]$_.Exception.Data['GameStatusReadFailed']
-                if(Request-MonitorQuickRecovery -Package $package -Failure $_.Exception -HealthOnly:$healthOnly -EmulatorOnly:($script:RecoveryScope -in @('Startup','Packages','VPN'))){Assert-PoolSetupTurn}
-                return 'Monitoring'
-            }
-            Write-WorkerRetryStatus -Failure $_.Exception -RetrySeconds $Config.RetryDelay -ReplacementActive:([bool]$script:PendingInstanceReplacement)
-            $recoveryConfig=$Config
-            try {
-                if($_.Exception.Data['AppCrashDialog']){
-                    $package=[string]$_.Exception.Data['GamePackage']
-                    if($package -and $Config.GamePackages -ccontains $package){
-                        $Config=$Config.Clone();$Config.GamePackage=$package;$Config.LauncherPackage=$package
-                        if($script:PoolAppState){foreach($app in $script:PoolAppState.Apps){if($app.Config.GamePackage -ceq $package){$app.Ready=$false}}}
-                    }
-                }
-                $recovery=Restart-AfterUnexpectedError
-                if($recovery -eq 'EmulatorReopened' -and $script:PoolAppState){
-                    foreach($app in $script:PoolAppState.Apps){$app.Ready=$false;$app.Confirmed=$false};$script:PoolAppState.LastProcessId=0
-                }
-            }
-            catch [System.Management.Automation.PipelineStoppedException] { throw }
-            catch [OperationCanceledException] { throw }
-            catch { Write-FlowStatus ('Recovery attempt failed: '+$_.Exception.Message+'. Retrying the full VPN/game flow.') }
-            finally {$Config=$recoveryConfig}
-            Clear-ProcessCheckCache
-            Start-Sleep -Seconds ([math]::Max(1,$Config.RetryDelay))
-        }
+    $base=$Config;$instance=Get-NoRootInstance
+    if($script:PoolRole -eq 'Monitor'){
+        if(-not $instance -or $instance.ProcessId -le 0 -or -not $instance.AndroidStarted -or $script:NoRootReadyBoot -ne $instance.ProcessId){Assert-PoolSetupTurn}
+        if((Get-NoRootRootMode) -or (Test-PoolScheduledRestartDue $instance)){Assert-PoolSetupTurn}
+    }else{
+        if($instance -and (Test-PoolScheduledRestartDue $instance)){Close-NoRootManagedInstance}
+        Start-SelectedEmulator
+        $instance=Get-NoRootInstance;$script:NoRootReadyBoot=$instance.ProcessId;$script:CurrentEmulatorInstance=$instance
     }
+    $script:CurrentEmulatorInstance=$instance
+    $apps=Get-HybridAppState $instance
+    Test-NoRootAppCrashLimit -Instance $instance
+    if($script:PoolRole -ne 'Monitor'){
+        $script:RecoveryScope='VPN';Ensure-SessionVpn;$script:RecoveryScope='Game'
+        if($script:PoolPendingRecovery){$pending=$script:PoolPendingRecovery;if($apps.ContainsKey([string]$pending.Package)){$apps[[string]$pending.Package].Ready=$false};$script:PoolPendingRecovery=$null}
+    }
+    try{
+        foreach($package in $base.GamePackages){
+            $Config=$base.Clone();$Config.GamePackage=$package;$Config.LauncherPackage=$package;$script:PoolActivePackage=$package
+            $app=$apps[$package];$watch=[Diagnostics.Stopwatch]::StartNew()
+            if($script:PoolRole -ne 'Monitor'){$app.RecoveryCheckUtc=$null}
+            while($true){
+                if(Test-FlowStopRequested){throw [OperationCanceledException]::new('Stopped during game checks.')}
+                Test-NoRootAppCrashLimit -Instance $instance
+                $waitingForJoin=$script:PoolRole -eq 'Setup' -and $null -ne $app.LinkSentUtc
+                $state=Get-LauncherSessionState -RequireReady:$waitingForJoin
+                if($state -cne $app.LastState){
+                    $checks=if($waitingForJoin){'PC presence + join marker/ADB'}else{'PC presence + Android/app state'}
+                    Write-FlowStatus "Game status: $state ($checks).";$app.LastState=$state
+                }
+                if($state -in @('Unknown','Minimized','Closed')){
+                    $app.Ready=$false
+                    $timeout=10;if($Config.AppStateRecoveryTimeout){$timeout=[int]$Config.AppStateRecoveryTimeout}
+                    $sample=if($script:HybridPresenceSamples){$script:HybridPresenceSamples[$package]}else{$null}
+                    $reason=if($state -eq 'Unknown' -and $sample -and -not $sample.Available){' '+$sample.Error}else{''}
+                    $label=if($state -eq 'Minimized'){'Hidden'}else{$state}
+                    if($script:PoolRole -eq 'Monitor'){
+                        $app.RecoveryCheckUtc=$null
+                        Write-FlowStatus ("App marked $label. Queued for a setup worker to recheck for $timeout seconds."+$reason)
+                        Assert-PoolSetupTurn
+                    }
+                    if($state -eq 'Unknown' -or -not $app.OpenRequestUtc){
+                        if(-not $app.RecoveryCheckUtc){
+                            $app.RecoveryCheckUtc=[datetime]::UtcNow
+                            Write-FlowStatus ("App is $label. Rechecking for up to $timeout seconds before closing it and running normal recovery."+$reason)
+                        }
+                        $elapsed=([datetime]::UtcNow-$app.RecoveryCheckUtc).TotalSeconds
+                        if($elapsed -lt $timeout){
+                            Wait-FlowPause ([int][math]::Min([math]::Max(1,$Config.PollInterval),[math]::Max(1,[math]::Ceiling($timeout-$elapsed))))
+                            continue
+                        }
+                        Reset-HybridAppForRecovery $package $app "App stayed unknown, hidden or closed for $timeout seconds in its setup turn."
+                        $state='Closed'
+                    }
+                }else{
+                    $app.RecoveryCheckUtc=$null
+                }
+                if($state -eq 'InGame'){$app.Ready=$true;$app.LinkSentUtc=$null;$app.JoiningUtc=$null;$app.OpenRequestUtc=$null;$app.NegativeCount=0;Reset-FlowStageTimeout -Stage Game;break}
+                    if($state -in @('Closed','Minimized','Crashed','NotResponding')){
+                        if($script:PoolRole -eq 'Monitor'){Reset-HybridAppForRecovery $package $app "App is $state."}
+                        if($state -eq 'Crashed'){Dismiss-AndroidAppCrashDialog -Package $package;$script:AppWindowSnapshotTicks=0;$script:NoRootCrashCheckTicks=0}
+                        $openTimeout=60;if($Config.LauncherOpenTimeout){$openTimeout=$Config.LauncherOpenTimeout}
+                        if($app.OpenRequestUtc -and ([datetime]::UtcNow-$app.OpenRequestUtc).TotalSeconds -ge $openTimeout){
+                            Register-FlowStageTimeout -Stage Game
+                            Reset-HybridAppForRecovery $package $app 'The game app did not become visible before its opening timeout.'
+                            $watch.Restart()
+                        }
+                        if(-not $app.OpenRequestUtc -or $state -eq 'Crashed'){
+                            $app.Ready=$false;$app.LinkSentUtc=$null;$app.JoiningUtc=$null
+                            Enter-EmulatorLoadingSlot
+                            if($state -eq 'NotResponding'){Invoke-Ld -Arguments @('killapp','--index',"$InstanceIndex",'--packagename',$package)|Out-Null}
+                            $app.OpenRequestUtc=[datetime]::UtcNow;$app.OpenedUtc=$app.OpenRequestUtc
+                            Invoke-Ld -Arguments @('runapp','--index',"$InstanceIndex",'--packagename',$package)|Out-Null
+                            $app.Opened=$true
+                        }
+                    }elseif($state -in @('Home','Disconnected')){
+                        $app.OpenRequestUtc=$null
+                        $sample=$script:HybridPresenceSamples[$package]
+                        if($sample.SampleTicks -ne $app.LastNegativeTicks){$app.LastNegativeTicks=$sample.SampleTicks;$app.NegativeCount++}
+                        if($script:PoolRole -eq 'Monitor'){
+                            if(-not $app.Ready -or $app.NegativeCount -ge 2){Reset-HybridAppForRecovery $package $app 'Presence confirmed the account is outside a game.'}
+                            break
+                        }
+                        if($state -eq 'Home'){
+                            if(-not $app.LinkSentUtc){
+                                if(-not $Config.ServerLink){throw 'No server link is assigned to this emulator.'}
+                                Enter-EmulatorLoadingSlot
+                                $app.LinkSentUtc=[datetime]::UtcNow;$app.JoiningUtc=$null
+                                $null=Open-ServerLinkWithRetry
+                            }elseif(([datetime]::UtcNow-$app.LinkSentUtc).TotalSeconds -ge $Config.GameHomeTimeout){
+                                Register-FlowStageTimeout -Stage Game
+                                Reset-HybridAppForRecovery $package $app 'Home persisted past the server-link timeout.'
+                                $watch.Restart()
+                            }
+                        }elseif($app.NegativeCount -ge 2){
+                            $openTimeout=60;if($Config.LauncherOpenTimeout){$openTimeout=$Config.LauncherOpenTimeout}
+                            if(-not $app.OpenedUtc -or ([datetime]::UtcNow-$app.OpenedUtc).TotalSeconds -ge $openTimeout){Reset-HybridAppForRecovery $package $app 'Presence confirmed the account is offline.';$watch.Restart()}
+                        }
+                    }elseif($state -eq 'Joining'){
+                        $app.OpenRequestUtc=$null
+                        $app.NegativeCount=0
+                        if(-not $app.JoiningUtc){$app.JoiningUtc=[datetime]::UtcNow}
+                        if($script:PoolRole -eq 'Monitor'){Assert-PoolSetupTurn}
+                        if(([datetime]::UtcNow-$app.JoiningUtc).TotalSeconds -ge $Config.GameJoinTimeout){
+                            Register-FlowStageTimeout -Stage Game
+                            Reset-HybridAppForRecovery $package $app 'The local readiness marker was not found before the join timeout.'
+                            $watch.Restart()
+                        }
+                    }
+                if($script:PoolRole -eq 'Monitor'){break}
+                Wait-FlowPause ([math]::Max(1,$Config.PollInterval))
+            }
+        }
+        if($script:PoolRole -ne 'Monitor'){
+            Set-BootRequestPhase Finished
+            Write-FlowStatus 'All game apps are in game. Server-link joins were checked for the local marker. Released the emulator setup slot.'
+        }
+        return 'Monitoring'
+    }finally{$script:HybridCapture=$null;$Config=$base}
 }
 
 function Initialize-RepairNotificationReader {
@@ -6281,17 +5181,7 @@ function Wait-ForLdPlayerRepairers {
 }
 
 
-function Invoke-StartupRepairPolicy {
-    if($Config.SkipRepairNextStart -eq 1){
-        
-        
-        Set-LauncherConfigValues -Path $Config.ConfigFilePath -Values @{SkipRepairNextStart='0'} -Automatic
-        $Config.SkipRepairNextStart=0
-        Write-Host 'Repair all skipped for this Start. The one-use skip toggle is now OFF.'
-        return
-    }
-    Repair-AllInstancesBeforeMainLoop
-}
+function Invoke-StartupRepairPolicy {Write-Host 'launcher uses offline backups, root-free ADB checks, PC presence and the local readiness marker.'}
 
 function Repair-AllInstancesBeforeMainLoop {
     if(@(Get-PendingInstanceReplacements $Config).Count){Write-Host 'An instance replacement is pending. Skipping startup repair until its registration is completed.';return}
@@ -6379,19 +5269,9 @@ function Invoke-PoolInstanceTurn {
     try{
         if($Role -eq 'Setup'){
             Enter-EmulatorLoadingSlot
-            
-            $cookiesReady=$false
-            try{$cookiesReady=Invoke-PendingGameAppCookieUpdates}
-            catch [System.Management.Automation.PipelineStoppedException]{throw}
-            catch [OperationCanceledException]{throw}
-            catch{Write-FlowStatus 'Captured cookie update will retry from its protected pending file; saved data was kept.'}
-            if(-not $cookiesReady){
-                Set-BootRequestPhase Failed
-                return 'NeedsSetup'
-            }
         }
         $status=Invoke-WorkerWithInstanceReplacement
-        if($status -in @('WaitingForCookie','Monitoring','Retired')){return [string]$status}
+        if($status -in @('WaitingForData','Monitoring','Retired')){return [string]$status}
         return 'Monitoring'
     }catch [OperationCanceledException]{
         if($Role -eq 'Monitor' -and $_.Exception.Data['LdCommandTimedOut']){
@@ -6486,7 +5366,7 @@ function Complete-EmulatorPoolTurn {
         $values=@($Worker.Task.EndInvoke($Worker.Handle))
         Write-EmulatorPoolTurnMessages $Worker
         if(-not $Worker.ErrorSeen){
-            $statuses=@($values|ForEach-Object{[string]$_}|Where-Object{$_ -in @('NeedsSetup','Monitoring','WaitingForCookie','Retired')})
+            $statuses=@($values|ForEach-Object{[string]$_}|Where-Object{$_ -in @('NeedsSetup','Monitoring','WaitingForData','Retired')})
             if($statuses.Count){$status=$statuses[-1]}
             elseif(-not $Worker.StopReason -and -not (Test-FlowStopRequested)){Write-Host "[LDPlayer $($record.Id)] Worker returned no completed turn; setup will retry."}
         }
@@ -6614,7 +5494,7 @@ function Get-EmulatorLiveStatusModel {
     if($snapshot.InstanceId -ne $Record.Id){$snapshot=$null}
     $boot=[string]$snapshot.EmulatorState;$apps=@($snapshot.Apps)
     $summary=switch($boot){
-        'Offline'{'Offline'};'Unresponsive'{'Unresponsive'};'Starting'{'Starting'};'Restarting'{'Restarting'};'Replacing'{'Replacing'};'CloseRequested'{'Emulator close requested'};'Unknown'{'Status unavailable'}
+        'Offline'{'Offline'};'Unresponsive'{'Unresponsive'};'Starting'{'Starting'};'Restarting'{'Restarting'};'Replacing'{'Replacing'};'CloseRequested'{'Emulator close requested'};'Unknown'{'Status unavailable'};'DataMaintenance'{'App-data maintenance (root on)'};'RootOffReady'{'App data ready; root off'}
         default{
             $observed=@($apps|Where-Object{$null -ne $_ -and $_.Package})
             if($observed.Count -gt 0 -and @($observed|Where-Object{$_.State -ne 'InGame'}).Count -eq 0){'InGame'}
@@ -6714,7 +5594,6 @@ function Invoke-FixedEmulatorWorkerPool {
             catch [OperationCanceledException]{throw}
             catch{Write-Host ('Replacement worker handoff will retry: '+$_.Exception.Message)}
             try{Update-EmulatorWindowLayout -Settings $Settings -State $layoutState}catch{Write-Host ('Window arrangement will retry: '+$_.Exception.Message)}
-            try{Update-CookieOverwriteTracking -Settings $Settings}catch{Write-Host ('Cookie overwrite status will retry: '+$_.Exception.Message)}
             try{Update-BootScheduler -Scheduler $scheduler -AliveIds @($records|ForEach-Object{[int]$_.Id})}
             catch [System.Management.Automation.PipelineStoppedException]{throw}
             catch [OperationCanceledException]{throw}
@@ -6809,8 +5688,6 @@ function Invoke-SelectedEmulators {
     if(-not $Settings.LdPlayerIds.Count){Write-Host 'No LDPlayer instances remain after applying the exclusions.';return @()}
     $assignments=@(Get-EmulatorServerAssignments -Settings $Settings)
     $Settings.LdPlayerIds=@($assignments|ForEach-Object{$_.InstanceId})
-    Initialize-CookieCheckTracking -Settings $Settings -Directory ([IO.Path]::GetDirectoryName($StateFile))
-    if($Settings.LogSnapshotLdPlayerId -ge 0 -and $Settings.LdPlayerIds -notcontains $Settings.LogSnapshotLdPlayerId){Write-Host "Log snapshot target LDPlayer $($Settings.LogSnapshotLdPlayerId) is not included. No snapshot will be taken for it."}
     $Settings.WindowLayoutDirectory=Join-Path ([IO.Path]::GetDirectoryName($StateFile)) 'window-layout'
     $Settings.ReplacementHandoffDirectory=Join-Path ([IO.Path]::GetDirectoryName($StateFile)) 'replacement-handoffs'
     $null=[IO.Directory]::CreateDirectory($Settings.WindowLayoutDirectory)
@@ -6830,17 +5707,11 @@ function Read-LauncherUiConfig {
     return $values
 }
 
-function Get-LauncherUiCookieSettings {
+function Get-LauncherUiRuntimeSettings {
     param([string]$Directory)
     $values=Read-LauncherUiConfig (Join-Path $Directory 'config.ini')
-    $packages=@()
-    if($values.GamePackages){$packages=@($values.GamePackages -split ','|ForEach-Object{$_.Trim()})}
-    elseif($values.GamePackage){$packages=@($values.GamePackage)}
-    else{$packages=@('local.deltalite.a')}
-    $path=Join-Path $Directory 'cookies.json'
-    $hash=[Security.Cryptography.SHA256]::Create()
-    try{$digest=[BitConverter]::ToString($hash.ComputeHash([Text.Encoding]::UTF8.GetBytes($path.ToLowerInvariant()))).Replace('-','')}finally{$hash.Dispose()}
-    return @{CookieStorePath=$path;CookieStoreMutexName=('Local\CodexCookieStore-'+$digest.Substring(0,24));GamePackages=$packages;GamePackage=$packages[0];CommandTimeout=30}
+    $packages=@(if($values.GamePackages){$values.GamePackages -split ','|ForEach-Object{$_.Trim()}}elseif($values.GamePackage){$values.GamePackage}else{'local.deltalite.a'})
+    return @{ConfigFilePath=(Join-Path $Directory 'config.ini');GamePackages=$packages;GamePackage=$packages[0];CommandTimeout=30}
 }
 
 function Set-LauncherUiProperty {
@@ -6918,10 +5789,10 @@ function Copy-LauncherUiLiveLog {
     Set-LauncherUiProperty $Ui.LogCopyStatus Text 'Copied all live logs.'
 }
 
-function Get-LauncherLogReadSettings {
+function Get-LauncherRuntimeSettings {
     param([string]$ConfigPath)
     $values=Read-LauncherUiConfig $ConfigPath
-    $settings=Get-LauncherUiCookieSettings ([IO.Path]::GetDirectoryName($ConfigPath))
+    $settings=Get-LauncherUiRuntimeSettings ([IO.Path]::GetDirectoryName($ConfigPath))
     $folder=$values.LdPlayerInstallPath
     if(-not $folder -and $values.LdConsolePath){$folder=[IO.Path]::GetDirectoryName($values.LdConsolePath)}
     if(-not $folder){$folder='C:\LDPlayer\LDPlayer9'}
@@ -6937,62 +5808,9 @@ function Get-LauncherLogReadSettings {
     return $settings
 }
 
-function Get-LauncherEmulatorLogText {
-    param([int]$Id)
-    $InstanceIndex=$Id
-    $deadline=[datetime]::UtcNow.AddSeconds(90)
-    $instance=Get-InstanceInfo -Id $Id
-    if(-not $instance -or $instance.ProcessId -le 0 -or -not $instance.AndroidStarted){throw "LDPlayer $Id must be running with Android started before copying its logs."}
-    $text=New-Object Text.StringBuilder
-    $null=$text.AppendLine("LDPlayer $Id - current game app logs")
-    $null=$text.AppendLine('Captured: '+[datetime]::Now.ToString('o'))
-    $captured=0
-    foreach($package in $Config.GamePackages){
-        $null=$text.AppendLine("`r`n===== $package =====")
-        try{
-            $reply=(Invoke-Android "shell pidof $package" -TimeoutSeconds (Get-CommandBudget $deadline)).Trim()
-            if($reply -notmatch '^\d+(?:\s+\d+)*$'){
-                if($reply){throw 'Android did not return valid app process IDs.'}
-                $null=$text.AppendLine('App is not running; no current log is available.');continue
-            }
-            $found=$false
-            foreach($appProcessId in ($reply -split '\s+')){
-                $descriptors=Invoke-Android "shell su -c 'ls -l /proc/$appProcessId/fd'" -TimeoutSeconds (Get-CommandBudget $deadline)
-                $pattern='(?m)^\S+[^\r\n]*?\s(?<fd>\d+)\s+->\s+(?<log>/data/(?:data|user/0)/'+[regex]::Escape($package)+'/files/appData/logs/[^\r\n]*_Player_[^\r\n]*\.log)\s*(?:\(deleted\))?\s*$'
-                $handle=[regex]::Matches($descriptors,$pattern) | Sort-Object {$_.Groups['log'].Value} -Descending | Select-Object -First 1
-                if(-not $handle){continue}
-                $fd=$handle.Groups['fd'].Value
-                $raw=Invoke-Android "shell su -c 'cat /proc/$appProcessId/fd/$fd'" -TimeoutSeconds (Get-CommandBudget $deadline)
-                if(-not $raw -or $raw -match '(?m)^(?:cat:|su:).*?(?:Permission denied|No such file|not found)'){throw 'The current player log could not be read.'}
-                
-                $raw=[regex]::Replace($raw,'(?i)(\.ROBLOSECURITY\s*[=:]\s*["'']?)[^\s;"''<>]+','$1[REDACTED]')
-                $raw=[regex]::Replace($raw,'(?im)(\b(?:Cookie|Authorization):\s*)[^\r\n]+','$1[REDACTED]')
-                $null=$text.AppendLine("--- PID $appProcessId ---")
-                $null=$text.AppendLine($raw.Replace([string][char]0,''));$found=$true;$captured++
-            }
-            if(-not $found){$null=$text.AppendLine('App is running, but no current Player log was found. Check Android root access.')}
-        }catch{$null=$text.AppendLine('Log unavailable: '+$_.Exception.Message)}
-    }
-    if(-not $captured){throw ('No game logs could be captured. '+$text.ToString())}
-    return $text.ToString()
-}
 
-function Start-LauncherUiEmulatorLogCopy {
-    if($Ui.ForceClosePending -or $Ui.ForceCloseTask){throw 'Wait for force close to finish.'}
-    if($Ui.LogReadTask){return}
-    $names=@('ConvertTo-LauncherConfigKey','Read-LauncherUiConfig','Get-LauncherUiCookieSettings','Get-LauncherLogReadSettings','ConvertTo-NativeArgument','Test-StatusCheckCommand','Wait-StatusCheckSlot','Start-LauncherProcess','Invoke-Ld','New-LdCommandTimeoutError','Invoke-Android','Get-InstanceInfo','Get-CommandBudget','Get-LauncherEmulatorLogText')
-    $definitions=foreach($name in $names){'function '+$name+" {`r`n"+(Get-Command $name -CommandType Function).Definition+"`r`n}"}
-    $worker=[Management.Automation.PowerShell]::Create()
-    try{
-        $code='param($Definitions,$ConfigPath,$Id) $ErrorActionPreference="Stop"; . ([scriptblock]::Create($Definitions)); $Config=Get-LauncherLogReadSettings $ConfigPath; Get-LauncherEmulatorLogText -Id $Id'
-        $null=$worker.AddScript($code).AddArgument(($definitions -join "`r`n")).AddArgument($Ui.ConfigPath).AddArgument([int]$Ui.LogEmulatorId.Value)
-        $handle=$worker.BeginInvoke()
-        $Ui.LogReadTask=@{Worker=$worker;Handle=$handle;Id=[int]$Ui.LogEmulatorId.Value}
-        Set-LauncherUiProperty $Ui.CopyEmulatorLog Enabled $false
-        Set-LauncherUiProperty $Ui.LogEmulatorId Enabled $false
-        Set-LauncherUiProperty $Ui.LogCopyStatus Text "Reading LDPlayer $($Ui.LogReadTask.Id) logs..."
-    }catch{$worker.Dispose();throw}
-}
+
+
 
 function Invoke-LauncherForceCloseProcesses {
     param([string]$Directory)
@@ -7001,7 +5819,7 @@ function Invoke-LauncherForceCloseProcesses {
     try{
         try{$held=$mutex.WaitOne(0)}catch [Threading.AbandonedMutexException]{$held=$true}
         if(-not $held){throw 'Automation is still running. No LDPlayer processes were force closed. Wait for Stop to finish and try again.'}
-        $names=@('dnplayer','ld9boxheadless','ld9BoxSVC');$stopped=@{};$failures=@{}
+        $names=@('dnplayer','ld9boxheadless','ld9BoxSVC','adb');$stopped=@{};$failures=@{}
         for($attempt=1;$attempt -le 3;$attempt++){
             $targets=@(Get-Process -Name $names -ErrorAction SilentlyContinue)
             foreach($process in $targets){
@@ -7055,7 +5873,7 @@ function Get-LauncherShutdownWorkerFunctionNames {
 
 function Invoke-LauncherCloseInstance {
     param($Settings,[int]$Id,$InstanceInfo)
-    $Config=$Settings.Clone();$InstanceIndex=$Id;$script:PoolRole=$null;$script:CookieAdbSerial=$null;$script:LastStatusCheckFinishedTicks=0
+    $Config=$Settings.Clone();$InstanceIndex=$Id;$script:PoolRole=$null;$script:AppDataAdbSerial=$null;$script:LastStatusCheckFinishedTicks=0
     $failures=New-Object 'System.Collections.Generic.List[string]';$blocked=$false;$cancelled=$false
     try{
         if(Test-FlowStopRequested){throw [OperationCanceledException]::new('Instance shutdown cancelled.')}
@@ -7091,7 +5909,7 @@ function Invoke-LauncherCloseRunningInstances {
     try{
         try{$held=$mutex.WaitOne(0)}catch [Threading.AbandonedMutexException]{$held=$true}
         if(-not $held){throw 'Automation is still running. Wait for Stop to finish before closing instances.'}
-        $configPath=Join-Path $Directory 'config.ini';$Config=Get-LauncherLogReadSettings $configPath
+        $configPath=Join-Path $Directory 'config.ini';$Config=Get-LauncherRuntimeSettings $configPath
         $values=Read-LauncherUiConfig $configPath;$delay=10
         if($values.PostSyncDelay -and (-not [int]::TryParse([string]$values.PostSyncDelay,[ref]$delay) -or $delay -lt 0 -or $delay -gt 3600)){throw 'Pause after disk sync must be between 0 and 3600 seconds.'}
         $Config.PostSyncDelay=$delay;$Config.LauncherRelaunchDelay=0;$Config.CommandTimeout=10;$Config.StopFilePath=$StopFile
@@ -7146,7 +5964,7 @@ function Invoke-LauncherCloseRunningInstances {
         $stoppedCount=@($ids|Where-Object{$_ -notin @($remaining.Id)}).Count
         $forceStoppedCount=0;$forceCloseRan=$false
         if(-not $cancelled -and -not (Test-FlowStopRequested)){
-            Write-Host 'Built-in instance close phase finished. Force closing remaining dnplayer.exe, ld9boxheadless.exe and ld9BoxSVC.exe processes...'
+            Write-Host 'Built-in instance close phase finished. Force closing remaining dnplayer.exe, ld9boxheadless.exe, ld9BoxSVC.exe and adb.exe processes...'
             $force=Invoke-LauncherForceCloseProcesses $Directory
             $forceCloseRan=$true;$forceStoppedCount=[int]$force.StoppedCount
             $remaining=@($force.Remaining)
@@ -7176,7 +5994,7 @@ function Start-LauncherUiStopAndClose {
 
 function Confirm-LauncherUiForceClose {
     if($Ui.ForceClosePending -or $Ui.ForceCloseTask){return}
-    $message="Force close ALL running dnplayer.exe, ld9boxheadless.exe and ld9BoxSVC.exe processes?`r`n`r`nThis affects every LDPlayer instance, including excluded instances. Unsaved app progress may be lost.`r`n`r`nThe tool will stop its workers and finish any active disk operation before force closing these processes."
+    $message="Force close ALL running dnplayer.exe, ld9boxheadless.exe, ld9BoxSVC.exe and adb.exe processes?`r`n`r`nThis affects every LDPlayer instance, including excluded instances. Unsaved app progress may be lost.`r`n`r`nThe tool will stop its workers and finish any active disk operation before force closing these processes."
     $answer=[Windows.Forms.MessageBox]::Show($Ui.Form,$message,'Force close LDPlayer',[Windows.Forms.MessageBoxButtons]::YesNo,[Windows.Forms.MessageBoxIcon]::Warning,[Windows.Forms.MessageBoxDefaultButton]::Button2)
     if($answer -ne [Windows.Forms.DialogResult]::Yes){return}
     $Ui.CloseInstances=$false;$Ui.ForceClosePending=$true
@@ -7193,19 +6011,19 @@ function Complete-LauncherUiForceClose {
     $label=if($graceful){'Stop and close'}else{'Force close'}
     $idleText=if($graceful){'Stop and close instances'}else{'Force close LDPlayer'}
     if($Ui.ForceClosePending -and -not $Ui.ForceCloseTask){
-        if(($Ui.Process -and -not $Ui.Process.HasExited) -or (Test-LauncherRunning $Ui.Directory) -or $Ui.LogReadTask -or $Ui.ArrangeTask){return}
+        if(($Ui.Process -and -not $Ui.Process.HasExited) -or (Test-LauncherRunning $Ui.Directory) -or $Ui.ArrangeTask){return}
         $worker=[Management.Automation.PowerShell]::Create()
         try{
             $names=@('Get-LauncherRunPaths','Invoke-LauncherForceCloseProcesses')
             $action='Invoke-LauncherForceCloseProcesses'
             if($graceful){
-                $names=@('Get-LauncherRunPaths','Invoke-LauncherForceCloseProcesses','Invoke-LauncherCloseRunningInstances','Get-LauncherShutdownWorkerFunctionNames','Get-LauncherLogReadSettings','Get-LauncherUiCookieSettings','Read-LauncherUiConfig','ConvertTo-LauncherConfigKey','Get-BootInventory')+@(Get-LauncherShutdownWorkerFunctionNames)
+                $names=@('Get-LauncherRunPaths','Invoke-LauncherForceCloseProcesses','Invoke-LauncherCloseRunningInstances','Get-LauncherShutdownWorkerFunctionNames','Get-LauncherRuntimeSettings','Get-LauncherUiRuntimeSettings','Read-LauncherUiConfig','ConvertTo-LauncherConfigKey','Get-BootInventory')+@(Get-LauncherShutdownWorkerFunctionNames)
                 $action='Invoke-LauncherCloseRunningInstances'
             }
             $definitions=foreach($name in $names){'function '+$name+" {`r`n"+(Get-Command $name -CommandType Function).Definition+"`r`n}"}
             $null=$worker.AddScript('param($Definitions,$Directory,$Action,$StopFile) $ErrorActionPreference="Stop"; . ([scriptblock]::Create($Definitions)); if($Action -eq "Invoke-LauncherCloseRunningInstances"){ & $Action $Directory -StopFile $StopFile }else{ & $Action $Directory }').AddArgument(($definitions -join "`r`n")).AddArgument($Ui.Directory).AddArgument($action).AddArgument([string]$Ui.CloseCancelPath)
             $handle=$worker.BeginInvoke();$Ui.ForceCloseTask=@{Worker=$worker;Handle=$handle}
-            Add-LauncherUiLog $(if($graceful){"Closing apps, then all running instances through LDPlayer...`r`n"}else{"Force closing dnplayer.exe, ld9boxheadless.exe and ld9BoxSVC.exe...`r`n"})
+            Add-LauncherUiLog $(if($graceful){"Closing apps, then all running instances through LDPlayer...`r`n"}else{"Force closing dnplayer.exe, ld9boxheadless.exe, ld9BoxSVC.exe and adb.exe...`r`n"})
         }catch{$worker.Dispose();$Ui.ForceClosePending=$false;$Ui.CloseInstances=$false;Set-LauncherUiProperty $button Text ($label+': retry');Add-LauncherUiLog ($label+' could not start: '+$_.Exception.Message+"`r`n");return}
     }
     $task=$Ui.ForceCloseTask
@@ -7297,23 +6115,7 @@ function Complete-LauncherUiWindowArrangement {
     }finally{$task.Worker.Dispose();$Ui.ArrangeTask=$null;Set-LauncherUiProperty $Ui.Arrange Enabled $true}
 }
 
-function Complete-LauncherUiEmulatorLogCopy {
-    $task=$Ui.LogReadTask
-    if(-not $task -or -not $task.Handle.IsCompleted){return}
-    try{
-        $result=$task.Worker.EndInvoke($task.Handle)
-        if($task.Worker.HadErrors){throw [string]$task.Worker.Streams.Error[0]}
-        Copy-LauncherUiText ($result -join "`r`n")
-        Set-LauncherUiProperty $Ui.LogCopyStatus Text "Copied LDPlayer $($task.Id) game logs."
-    }catch{
-        Set-LauncherUiProperty $Ui.LogCopyStatus Text 'Could not copy emulator logs.'
-        Add-LauncherUiLog ('Copy emulator logs: '+$_.Exception.Message+"`r`n")
-    }finally{
-        $task.Worker.Dispose();$Ui.LogReadTask=$null
-        Set-LauncherUiProperty $Ui.CopyEmulatorLog Enabled $true
-        Set-LauncherUiProperty $Ui.LogEmulatorId Enabled $true
-    }
-}
+
 
 function Initialize-LauncherOutputReader {
     if('LauncherOutputReader' -as [type]){return}
@@ -7383,6 +6185,7 @@ function Clear-LauncherRunState {
 
 function Read-LauncherUiSettings {
     $values=Read-LauncherUiConfig $Ui.ConfigPath
+    if(-not $values.Contains('AppStateRecoveryTimeout')){$values['AppStateRecoveryTimeout']='10'}
     if(-not $values.Contains('ResetInstanceCount')){$values['ResetInstanceCount']='20'}
     if(-not $values.Contains('InstancesPerRow')){$values['InstancesPerRow']='5'}
     foreach($key in @('PackageCheckFailuresBeforeRestart','PackageCheckRecoveryCyclesBeforeRestore','AppCrashLimit')){if(-not $values.Contains($key)){$values[$key]='2'}}
@@ -7393,7 +6196,7 @@ function Read-LauncherUiSettings {
 
     if(-not $values.Contains('RecoveryMode')){$values['RecoveryMode']='Backup'}
     if(-not $values.Contains('RecoveryTemplateId')){$values['RecoveryTemplateId']='0'}
-    $labels=@{GamePackages='Game app packages';MaxLoadingInstances='Emulators loading at once';MaxReplacingInstances='Instance replacements at once';CloudflareTimeoutLimit='VPN timeouts before replacement';InstanceOpenTimeoutLimit='Startup timeouts before replacement';GameOpenTimeoutLimit='Game timeouts before replacement';RestoreBackupFile='Restore backup (.ldbk)';AutoRestartHours='Restart after (hours)';PostSyncDelay='Pause after disk sync (seconds)';ExcludedLdPlayerIds='Excluded emulator IDs';LdPlayerInstallPath='LDPlayer installation folder';GameCheckInterval='Game check interval (seconds)';GameHomeTimeout='Home timeout after link (seconds)';GameJoinTimeout='Join timeout (seconds)';LauncherOpenTimeout='Game app opening timeout (seconds)'}
+    $labels=@{AppStateRecoveryTimeout='Unknown/hidden/closed app timeout (seconds)';GamePackages='Game app packages';MaxLoadingInstances='Emulators loading at once';MaxReplacingInstances='Instance replacements at once';CloudflareTimeoutLimit='VPN timeouts before replacement';InstanceOpenTimeoutLimit='Startup timeouts before replacement';GameOpenTimeoutLimit='Game timeouts before replacement';RestoreBackupFile='Restore backup (.ldbk)';AutoRestartHours='Restart after (hours)';PostSyncDelay='Pause after disk sync (seconds)';ExcludedLdPlayerIds='Excluded emulator IDs';LdPlayerInstallPath='LDPlayer installation folder';GameCheckInterval='Game check interval (seconds)';GameHomeTimeout='Home timeout after link (seconds)';GameJoinTimeout='Join timeout (seconds)';LauncherOpenTimeout='Game app opening timeout (seconds)'}
     $Ui.Settings.Rows.Clear()
     $labels['InstancesPerRow']='Instances per row'
     $labels['ResetInstanceCount']='Game emulators after reset (plus template 0)'
@@ -7403,19 +6206,19 @@ function Read-LauncherUiSettings {
     $labels['RestoreBackupFile']='Reset backup (.ldbk)'
     $labels['PackageCheckFailuresBeforeRestart']='Failed package checks before creating a replacement instance'
     $labels['PackageCheckRecoveryCyclesBeforeRestore']='Failed package-check loads before disk recovery'
-    $labels['AppCrashLimit']='Crashes of the same app before emulator restart'
+    $labels['AppCrashLimit']='Crashes of the same app before instance replacement'
     $labels['MaxLoadingInstances']='Loading limit at/below running threshold'
     $labels['LoadingInstanceThreshold']='Running emulator threshold (0 disables)'
     $labels['MaxLoadingInstancesAboveThreshold']='Loading limit above running threshold'
     $groups=[ordered]@{
         'Instances and workload'=@('LdPlayerInstallPath','LdConsolePath','GamePackages','MaxLoadingInstances','LoadingInstanceThreshold','MaxLoadingInstancesAboveThreshold','MaxReplacingInstances','EmulatorsPerServerLink','InstancesPerRow')
         'Timeout and failure counts'=@('InstanceOpenTimeoutLimit','CloudflareTimeoutLimit','PackageCheckFailuresBeforeRestart','AppCrashLimit','MaxCloudflareAttempts','MaxServerLinkAttempts')
-        'Timeouts (seconds)'=@('LdPlayerOpenTimeout','CloudflareOpenTimeout','CloudflareConnectTimeout','LauncherOpenTimeout','GameJoinTimeout','GameHomeTimeout','CommandTimeout')
+        'Timeouts (seconds)'=@('LdPlayerOpenTimeout','CloudflareOpenTimeout','CloudflareConnectTimeout','LauncherOpenTimeout','GameJoinTimeout','GameHomeTimeout','AppStateRecoveryTimeout','CommandTimeout')
         'Check intervals and retry delays (seconds)'=@('GameCheckInterval','PollInterval','MinCheckDelay','RetryDelay','PackageCheckRetryDelay','CloudflarePollInterval','CloudflareRetryDelay','InstanceLaunchDelay','InstanceRelaunchDelay','LauncherRelaunchDelay')
         'Scheduled restart and shutdown'=@('AutoRestartHours','PostSyncDelay')
-        'Game detection and diagnostics'=@('MonitorGame','GameReadyLogMarker','LogSnapshotLdPlayerId')
+        'Game monitoring'=@('MonitorGame','GameReadyLogMarker','LogSnapshotLdPlayerId')
     }
-    $hidden=@('ResetInstanceCount','RestoreBackupFile','RecoveryMode','RecoveryTemplateId','OverwriteExistingCookies','SkipRepairNextStart','ServerLink','GameOpenTimeoutLimit','PackageCheckRecoveryCyclesBeforeRestore','MaxInstanceLaunchAttempts','CookieAuthenticationInterval')
+    $hidden=@('LogSnapshotLdPlayerId','GameReadyLogMarker','PackageCheckFailuresBeforeRestart','PackageCheckRetryDelay','ResetInstanceCount','RestoreBackupFile','RecoveryMode','RecoveryTemplateId','SkipRepairNextStart','ServerLink','GameOpenTimeoutLimit','PackageCheckRecoveryCyclesBeforeRestore','MaxInstanceLaunchAttempts')
     $visible=@($values.Keys|Where-Object{$_ -notin $hidden -and $_ -notmatch '^ServerLink\.[1-9][0-9]*$'})
     $settingNames=New-Object 'System.Collections.Generic.List[string]';$assigned=@{}
     if($visible -contains 'ExcludedLdPlayerIds'){$settingNames.Add('ExcludedLdPlayerIds');$assigned['ExcludedLdPlayerIds']=$true}
@@ -7454,7 +6257,6 @@ function Read-LauncherUiSettings {
     $linkKeys=@($values.Keys|Where-Object{$_ -match '^ServerLink\.[1-9][0-9]*$'}|Sort-Object{[int]($_.Split('.')[1])})
     $links=if($linkKeys.Count){@($linkKeys|ForEach-Object{[string]$values[$_]})}else{@([string]$values.ServerLink)}
     $Ui.ServerLinks.Text=(@($links|Where-Object{$_ -and $_.Trim()}|ForEach-Object{$_.Trim()}) -join "`r`n")
-    $Ui.Overwrite.Checked=($values.OverwriteExistingCookies -eq '1')
     $Ui.SkipRepair.Checked=($values.SkipRepairNextStart -eq '1')
     $count=20
     if(-not [int]::TryParse([string]$values.ResetInstanceCount,[ref]$count) -or $count -lt 0 -or $count -gt 1000){throw 'The reset count must be a whole number from 0 to 1000, plus template 0.'}
@@ -7472,7 +6274,7 @@ function Get-LauncherUiServerLinks {
 }
 
 function Update-LauncherUiInputSizes {
-    param([ValidateSet('All','Links','Cookie','Setting')][string]$Part='All')
+    param([ValidateSet('All','Links','Setting')][string]$Part='All')
     if($Part -in @('All','Links') -and $Ui.ServerLinks){
         $width=[math]::Max(120,$Ui.ServerLinks.ClientSize.Width-12)
         $text=if($Ui.ServerLinks.Text){$Ui.ServerLinks.Text}else{' '}
@@ -7484,14 +6286,7 @@ function Update-LauncherUiInputSizes {
         $count=@($Ui.ServerLinks.Text -split '\r?\n'|Where-Object{$_.Trim()}).Count
         Set-LauncherUiProperty $Ui.LinkCount Text "$count server link(s). One link per line; blank lines are ignored."
     }
-    if($Part -in @('All','Cookie') -and $Ui.CookieInput -and $Ui.CookieEdit){
-        $remaining=$Ui.CookieEdit.ClientSize.Width-12
-        foreach($control in $Ui.CookieEdit.Controls){if($control -ne $Ui.CookieInput){$remaining-=$control.Width+$control.Margin.Horizontal}}
-        $remaining=[math]::Max(160,$remaining-$Ui.CookieInput.Margin.Horizontal)
-        $mask=([string][char]0x25cf)*([math]::Min(512,[math]::Max(1,$Ui.CookieInput.TextLength)))
-        $size=[Windows.Forms.TextRenderer]::MeasureText($mask,$Ui.CookieInput.Font)
-        Set-LauncherUiProperty $Ui.CookieInput Width ([int][math]::Min($remaining,[math]::Max(180,$size.Width+20)))
-    }
+    
     if($Part -in @('All','Setting') -and $Ui.Settings -and $Ui.Settings.IsCurrentCellInEditMode -and $Ui.Settings.EditingControl){
         $cell=$Ui.Settings.CurrentCell;$editor=$Ui.Settings.EditingControl
         $width=[math]::Max(80,$cell.Size.Width-12)
@@ -7504,43 +6299,34 @@ function Update-LauncherUiInputSizes {
 function Save-LauncherUiSettings {
     if(Test-LauncherRunning $Ui.Directory){throw 'Stop the tool before changing settings.'}
     $null=$Ui.Settings.EndEdit()
-    $values=@{OverwriteExistingCookies='0';SkipRepairNextStart=$(if($Ui.SkipRepair.Checked){'1'}else{'0'});ResetInstanceCount=[string][int]$Ui.ResetCount.Value}
+    $values=@{SkipRepairNextStart=$(if($Ui.SkipRepair.Checked){'1'}else{'0'});ResetInstanceCount=[string][int]$Ui.ResetCount.Value}
     foreach($row in $Ui.Settings.Rows) {
         if($row.IsNewRow -or -not $row.Tag){continue}
         $values[[string]$row.Tag]=[string]$row.Cells[1].Value
     }
     $links=@(Get-LauncherUiServerLinks)
-    if($links.Count -eq 0){throw 'Add at least one server link before saving settings.'}
+    
     for($i=0;$i -lt $links.Count;$i++){$values['ServerLink.'+($i+1)]=$links[$i]}
     Set-LauncherConfigValues -Path $Ui.ConfigPath -Values $values -ReplaceServerLinks
 }
 
-function Update-LauncherCookieMismatchNotice {
-    param([object[]]$Statuses)
-    $ids=@($Statuses|Where-Object{$_.Status -eq 'Cookie mismatch' -and [string]$_.InstanceId -match '^\d+$'}|ForEach-Object{[int]$_.InstanceId}|Sort-Object -Unique)
-    $text=if($ids.Count){'Cookie mismatch detected (ID): '+($ids -join ',')}else{''}
-    Set-LauncherUiProperty $Ui.CookieMismatch Text $text
-    Set-LauncherUiProperty $Ui.CookieMismatch Visible ([bool]$ids.Count)
-}
+
 
 function Read-LauncherUiAccounts {
     $map=$null
     try{
-        $Config=Get-LauncherUiCookieSettings $Ui.Directory
+        $Config=Get-LauncherUiRuntimeSettings $Ui.Directory
         $root=Get-GameAppDataRoot $Config
-        $files=@();if([IO.Directory]::Exists($root)){$files=@(Get-ChildItem -LiteralPath $root -Filter manifest.json -File -Recurse|Sort-Object FullName)}
+        $files=@();if([IO.Directory]::Exists($root)){$files=@(Get-ChildItem -LiteralPath $root -Directory|Where-Object{$_.Name -match '^\d+$'}|ForEach-Object{Get-Item -LiteralPath (Join-Path $_.FullName 'manifest.json') -ErrorAction SilentlyContinue})}
         $fingerprint=$root+'|'+(@($files|ForEach-Object{$_.FullName+':'+$_.Length+':'+$_.LastWriteTimeUtc.Ticks}) -join '|')
         if($Ui.AccountsFingerprint -ceq $fingerprint){return}
         $models=New-Object 'System.Collections.Generic.List[object]'
         foreach($file in $files){
-            $id=$file.Directory.Parent.Name;$package=$file.Directory.Name
-            if($id -notmatch '^\d+$'){continue}
-            $paths=Get-GameAppDataPaths -Id ([int]$id) -Package $package -Settings $Config
-            $entry=Read-GameAppDataManifest $paths
-            $state=if($entry.RestoreRequired){'Restore pending'}else{'Saved'}
-            $models.Add([pscustomobject]@{Key="$id|$package";Values=[object[]]@($id,$package,([math]::Round($entry.Length/1MB,1).ToString()+' MB'),$entry.SavedUtc,$state,'Private app data and package external folders');Mismatch=$false})
+            $id=[int]$file.Directory.Name;$entry=Get-DiskBackupEntry $Config $id
+            if(-not $entry){continue}
+            $size=0L;foreach($property in $entry.Manifest.Files.PSObject.Properties){$size+=[long]$property.Value.Length}
+            $models.Add([pscustomobject]@{Key=[string]$id;Values=[object[]]@($id,($entry.Manifest.Packages -join ', '),([math]::Round($size/1GB,2).ToString()+' GB'),$entry.Manifest.SavedUtc,'Verified backup','data.vmdk, sdcard.vmdk, config and VM registration')})
         }
-        Set-LauncherUiProperty $Ui.CookieMismatch Visible $false
         $grid=$Ui.Accounts;$selected='';$topKey='';$oldCell=$grid.CurrentCell;$horizontal=$grid.HorizontalScrollingOffset
         if($grid.SelectedRows.Count){$selected=[string]$grid.SelectedRows[0].Tag}
         if($grid.FirstDisplayedScrollingRowIndex -ge 0){$topKey=[string]$grid.Rows[$grid.FirstDisplayedScrollingRowIndex].Tag}
@@ -7562,7 +6348,7 @@ function Read-LauncherUiAccounts {
                 for($column=0;$column -lt $model.Values.Count;$column++){
                     if(-not [object]::Equals($row.Cells[$column].Value,$model.Values[$column])){$row.Cells[$column].Value=$model.Values[$column]}
                 }
-                $color=if($model.Mismatch){[Drawing.Color]::FromArgb(255,135,140)}else{[Drawing.Color]::Empty}
+                $color=[Drawing.Color]::Empty
                 if(-not $row.DefaultCellStyle.ForeColor.Equals($color)){$row.DefaultCellStyle.ForeColor=$color}
                 $position++
             }
@@ -7570,15 +6356,15 @@ function Read-LauncherUiAccounts {
                 $row=$rows[$selected]
                 if($oldCell -and $oldCell.OwningRow -eq $row -and $grid.CurrentCell -ne $oldCell){$grid.CurrentCell=$oldCell}
                 if(-not $row.Selected){$grid.ClearSelection();$row.Selected=$true}
-            }elseif($selected -and $Ui.CookieInput.TextLength){$Ui.CookieInput.Clear()}
+            }
             try{
                 if($topKey -and $rows.ContainsKey($topKey) -and $rows[$topKey].Visible -and $grid.FirstDisplayedScrollingRowIndex -ne $rows[$topKey].Index){$grid.FirstDisplayedScrollingRowIndex=$rows[$topKey].Index}
                 if($grid.HorizontalScrollingOffset -ne $horizontal){$grid.HorizontalScrollingOffset=$horizontal}
             }catch{}
         }finally{$grid.ResumeLayout($false);$Ui.RefreshingAccounts=$false}
-        Set-LauncherUiProperty $Ui.CookieHint Text 'Game data is saved when a cookie is present and restored when it is missing. Login apps release their slot and wait for a cookie. Snapshots contain private account data.'
+        Set-LauncherUiProperty $Ui.AppDataHint Text 'Complete emulator backups and account metadata are stored in the backup folder.'
         $Ui.AccountsFingerprint=$fingerprint
-    }catch{Set-LauncherUiProperty $Ui.CookieHint Text 'Could not read an app-data snapshot. Check the live log and app-data folder.'}
+    }catch{Set-LauncherUiProperty $Ui.AppDataHint Text 'Could not read an emulator backup. Check the live log and backup folder.'}
     finally{$map=$null}
 }
 
@@ -7586,7 +6372,7 @@ function Get-LauncherResetSettings {
     param([string]$ConfigPath)
     $directory=[IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($ConfigPath))
     $values=Read-LauncherUiConfig $ConfigPath
-    $settings=Get-LauncherUiCookieSettings $directory
+    $settings=Get-LauncherUiRuntimeSettings $directory
     $count=20
     if($values.Contains('ResetInstanceCount') -and (-not [int]::TryParse([string]$values.ResetInstanceCount,[ref]$count) -or $count -lt 0 -or $count -gt 1000)){throw 'ResetInstanceCount must be a whole number from 0 to 1000, excluding template 0.'}
     $settings.ResetInstanceCount=$count;$settings.ConfigFilePath=[IO.Path]::GetFullPath($ConfigPath)
@@ -7766,7 +6552,8 @@ function Initialize-LauncherResetInstance {
             if((Get-Item -LiteralPath $path).Length -ne (Get-Item -LiteralPath (Join-Path $source $name)).Length){throw "The copied disk for emulator $Id has an unexpected length."}
             if($Id -gt 0){$uuid=if($name -eq 'data.vmdk'){$dataUuid}else{$sdUuid};Set-TemplateDiskHostUuid $path $uuid}
         }
-        $configuration|Add-Member NoteProperty 'basicSettings.autoRun' $false -Force
+        $configuration|Add-Member NoteProperty 'basicSettings.rootMode' $false -Force
+    $configuration|Add-Member NoteProperty 'basicSettings.autoRun' $false -Force
         $configuration|Add-Member NoteProperty 'statusSettings.playerName' "LDPlayer-$Id" -Force
         [IO.File]::WriteAllText((Join-Path $target 'leidian.vbox'),$xml.OuterXml,[Text.UTF8Encoding]::new($false))
         [IO.File]::WriteAllText($targetConfig,($configuration|ConvertTo-Json -Depth 30),[Text.UTF8Encoding]::new($false))
@@ -7833,9 +6620,10 @@ function Publish-LauncherResetFiles {
 }
 
 function Clear-LauncherResetState {
+    Clear-LegacyDiskBackupState
     $directory=[IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($Config.ConfigFilePath))
     $appData=[IO.Path]::GetFullPath((Get-GameAppDataRoot $Config))
-    if($appData -ine (Join-Path $directory 'app-data')){throw 'Reset app-data cleanup target is outside the tool folder.'}
+    if($appData -ine (Join-Path $directory 'backup')){throw 'Reset app-data cleanup target is outside the tool folder.'}
     Assert-InstanceReplacementDirectory $appData $directory
     if([IO.Directory]::Exists($appData)){
         $pendingDirectories=New-Object 'System.Collections.Generic.Stack[string]';$pendingDirectories.Push($appData)
@@ -7848,13 +6636,11 @@ function Clear-LauncherResetState {
         }
         [IO.Directory]::Delete($appData,$true)
     }
-    if($Config.CookieStorePath -and [IO.File]::Exists($Config.CookieStorePath)){
-        Assert-InstanceReplacementDirectory $Config.CookieStorePath $directory
-        [IO.File]::Delete($Config.CookieStorePath)
-    }
+    
     $run=Read-LauncherRunRecord $directory
     if($run){Clear-LauncherRunState $run.RunDirectory}
-    Write-Host 'Deleted saved app-data snapshots, standalone cookies, pending cookie updates and legacy cookies. Clearing recovery queues...'
+    $warning=Join-Path $directory 'backup-warning.json';if([IO.File]::Exists($warning)){[IO.File]::Delete($warning)}
+    Write-Host 'Deleted emulator backups and account metadata. Clearing recovery queues...'
     $vms=Join-Path $Config.LdPlayerInstallPath 'vms'
     foreach($item in @(Get-ChildItem -LiteralPath $vms -Force -Directory)){
         if($item.Name -notmatch '^[.](?:launcher-template|launcher-replacement|launcher-reset)-\d+-[a-f0-9]{32}$'){continue}
@@ -8003,7 +6789,7 @@ function Invoke-LauncherGeneralReset {
         if((($inventory.Keys|Sort-Object) -join ',') -cne ((0..$Config.ResetInstanceCount) -join ',')){throw 'The final instance IDs do not match the requested copies.'}
         Set-LauncherConfigValues $Config.ConfigFilePath @{ExcludedLdPlayerIds='0';RecoveryTemplateId='0';ResetInstanceCount=[string]$Config.ResetInstanceCount} -Automatic
         [IO.File]::Delete($Config.ResetPendingPath)
-        Write-Host "RESET COMPLETE: created $($Config.ResetInstanceCount) new copies, IDs: $range. Template 0 was kept; saved app data, cookies and queues were cleared. All instances are closed."
+        Write-Host "RESET COMPLETE: created $($Config.ResetInstanceCount) new copies, IDs: $range. Template 0 was kept; saved app data and queues were cleared. All instances are closed."
     }finally{
         if($sourceLocks){foreach($lock in $sourceLocks){$lock.Dispose()}}
         if($replacementHeld){$replacementMutex.ReleaseMutex()};$replacementMutex.Dispose()
@@ -8014,13 +6800,12 @@ function Invoke-LauncherGeneralReset {
 function Confirm-LauncherUiReset {
     if($Ui.ForceClosePending -or $Ui.ForceCloseTask){throw 'Wait for force close to finish.'}
     if(($Ui.Process -and -not $Ui.Process.HasExited) -or (Test-LauncherRunning $Ui.Directory)){throw 'Stop the tool before creating emulator copies.'}
-    if($Ui.LogReadTask){throw 'Wait for the emulator log copy to finish.'}
     if($Ui.ArrangeTask){throw 'Wait for window arrangement to finish.'}
     $null=$Ui.Settings.EndEdit();$count=[int]$Ui.ResetCount.Value
     Save-LauncherUiSettings
     $settings=Get-LauncherResetSettings $Ui.ConfigPath
     $null=Assert-LauncherResetOnlyTemplate $settings
-    $message="Create exactly $count new instances (IDs 1-$count) by copying the existing LDPlayer 0?`r`n`r`nOnly LDPlayer 0 may exist before starting. No emulator is deleted. Template 0 is kept and closed before copying.`r`n`r`nAll locally saved app-data snapshots, standalone cookies, pending cookie updates and legacy cookies will be deleted. Exclusions and recovery queues are reset.`r`n`r`nEach copy uses native new-instance followed by direct file copying, without the clone feature."
+    $message="Create exactly $count new instances (IDs 1-$count) by copying the existing LDPlayer 0?`r`n`r`nOnly LDPlayer 0 may exist before starting. No emulator is deleted. Template 0 is kept and closed before copying.`r`n`r`nAll locally saved app-data snapshots, local metadata will be deleted. Exclusions and recovery queues are reset.`r`n`r`nEach copy uses native new-instance followed by direct file copying, without the clone feature."
     if($count -eq 0){$message=$message.Replace('Create exactly 0 new instances (IDs 1-0)','Keep template 0 without creating new instances')}
     $answer=[Windows.Forms.MessageBox]::Show($Ui.Form,$message,'Create copies from LDPlayer 0',[Windows.Forms.MessageBoxButtons]::YesNo,[Windows.Forms.MessageBoxIcon]::Question,[Windows.Forms.MessageBoxDefaultButton]::Button2)
     if($answer -eq [Windows.Forms.DialogResult]::Yes){Start-LauncherUiRun -Operation Reset}
@@ -8066,7 +6851,7 @@ function New-LauncherNativeResetInstance {
 
 
 
-function Save-LauncherUiCookie { throw 'Cookie editing has been replaced by automatic game-data snapshots.' }
+
 
 function New-LauncherWorkerStartInfo {
     param([string]$LauncherPath,[string]$Directory,[string]$RunDirectory,[ValidateSet('worker','reset')][string]$Mode)
@@ -8090,7 +6875,6 @@ function Start-LauncherUiRun {
     if($Ui.Process -and -not $Ui.Process.HasExited){throw 'The previous run is still stopping. Wait until the status says Stopped.'}
     if(Test-LauncherRunning $Ui.Directory){throw 'The tool is already running from this folder.'}
     if($Ui.ArrangeTask){throw 'Wait for window arrangement to finish.'}
-    if($Ui.LogReadTask -and $Operation -eq 'Reset'){throw 'Wait for the emulator log copy to finish before resetting.'}
     if($Operation -eq 'Reset'){$settings=Get-LauncherResetSettings $Ui.ConfigPath}
     else{
         Assert-LauncherResetNotPending $Ui.Directory
@@ -8177,7 +6961,7 @@ function Update-LauncherUiWorkerStatus {
 }
 
 function Update-LauncherUi {
-    Complete-LauncherUiEmulatorLogCopy
+
     Complete-LauncherUiWindowArrangement
     Complete-LauncherUiForceClose
     if($Ui.OutputSink){Add-LauncherUiLog ($Ui.OutputSink.Drain())}
@@ -8187,7 +6971,7 @@ function Update-LauncherUi {
     if($busy -and -not $Ui.LastWasBusy){$null=$Ui.Settings.EndEdit()}
     Set-LauncherUiProperty $Ui.Settings ReadOnly ([bool]($busy -or $forceBusy))
     Set-LauncherUiProperty $Ui.ServerLinks ReadOnly ([bool]($busy -or $forceBusy))
-    foreach($name in @('Overwrite','SkipRepair','Save','Reload','CookieInput','ApplyCookie','ClearCookie','Reset','ResetCount')){Set-LauncherUiProperty $Ui[$name] Enabled (-not $busy -and -not $forceBusy)}
+    foreach($name in @('SkipRepair','Save','Reload','Reset','ResetCount')){Set-LauncherUiProperty $Ui[$name] Enabled (-not $busy -and -not $forceBusy)}
     Set-LauncherUiProperty $Ui.ForceClose Enabled (-not $forceBusy)
     Set-LauncherUiProperty $Ui.StopClose Enabled (-not $forceBusy)
     if($forceBusy){$closeButton=if($Ui.CloseInstances){$Ui.StopClose}else{$Ui.ForceClose};Set-LauncherUiProperty $closeButton Text $(if($Ui.ForceCloseTask){'Closing LDPlayer...'}else{'Waiting for stop...'})}
@@ -8215,7 +6999,6 @@ function Update-LauncherUi {
     $resetBusy=$busy -and $Ui.Operation -eq 'Reset'
     Set-LauncherUiProperty $Ui.Arrange Enabled (-not $resetBusy -and -not $Ui.ArrangeTask -and -not $forceBusy)
     if($Ui.ArrangeTask){Set-LauncherUiProperty $Ui.Reset Enabled $false;$canStart=$false}
-    if(-not $Ui.LogReadTask){Set-LauncherUiProperty $Ui.CopyEmulatorLog Enabled (-not $resetBusy -and -not $forceBusy);Set-LauncherUiProperty $Ui.LogEmulatorId Enabled (-not $resetBusy -and -not $forceBusy)}
     Set-LauncherUiProperty $Ui.Start Enabled ([bool]$canStart)
     $status=if($forceBusy){$(if($Ui.CloseCancelRequested){'Cancelling instance shutdown - waiting for the current safe step...'}elseif($Ui.ForceCloseTask){if($Ui.CloseInstances){'Closing apps and running LDPlayer instances...'}else{'Force closing LDPlayer processes...'}}else{'Waiting for current operations to stop before closing LDPlayer...'})}elseif($Ui.StopPending -and $busy){'Stopping - waiting for the current operation to finish...'}elseif($resetBusy){'Resetting emulators - settings are locked'}elseif($busy){'Running - settings are locked'}else{'Stopped - settings can be changed'}
     Set-LauncherUiProperty $Ui.Status Text $status
@@ -8224,11 +7007,7 @@ function Update-LauncherUi {
     Update-LauncherUiWorkerStatus -Running $busy -Record $record
     if($resetBusy){Set-LauncherUiProperty $Ui.Progress Text 'Reset in progress. Stop waits for the current disk operation to finish.'}
     elseif($busy -and $record){
-        try{
-            $progress=ConvertFrom-Json ([IO.File]::ReadAllText((Join-Path $record.RunDirectory 'cookie-check-progress.json')))
-            Set-LauncherUiProperty $Ui.Overwrite Checked ([bool]$progress.OverwriteEnabled)
-            Set-LauncherUiProperty $Ui.Progress Text "Initial game-data checks: $($progress.Checked)/$($progress.Total)."
-        }catch{Set-LauncherUiProperty $Ui.Progress Text 'Starting - game-data snapshots have not begun yet.'}
+        Set-LauncherUiProperty $Ui.Progress Text 'Offline backups; PC presence and local readiness marker; root OFF.' 
     }elseif(-not $busy){Set-LauncherUiProperty $Ui.Progress Text ''}
     if($Ui.LastWasBusy -and -not $busy){
         if($Ui.Tabs){$Ui.Tabs.SelectedTab=$Ui.SettingsTab}
@@ -8236,12 +7015,11 @@ function Update-LauncherUi {
         if($Ui.OutputSink){Add-LauncherUiLog ($Ui.OutputSink.Drain());$Ui.OutputSink.Dispose();$Ui.OutputSink=$null}
         if($Ui.Process){$Ui.LastExitCode=$Ui.Process.ExitCode;$Ui.Process.Dispose();$Ui.Process=$null}
         if($Ui.Operation -eq 'Reset'){
-            $Ui.CookieInput.Clear();$Ui.AccountsFingerprint=''
+            $Ui.AccountsFingerprint=''
             if($Ui.LastExitCode -eq 0){Add-LauncherUiLog "Reset finished. Use Start tool when ready.`r`n"}
             else{Add-LauncherUiLog "Copy creation did not finish. Keep LDPlayer 0, remove partial copies manually, then use Reset emulators again. No emulator was deleted by this reset.`r`n"}
         }else{Add-LauncherUiLog "Tool stopped. You can start it again.`r`n"}
         if($savedSettings){
-            Set-LauncherUiProperty $Ui.Overwrite Checked ([bool]($savedSettings.OverwriteExistingCookies -eq '1'))
             Set-LauncherUiProperty $Ui.SkipRepair Checked ([bool]($savedSettings.SkipRepairNextStart -eq '1'))
         }
         Read-LauncherUiAccounts
@@ -8249,6 +7027,7 @@ function Update-LauncherUi {
     }
     $Ui.LastWasBusy=$busy
     if(([datetime]::UtcNow-$Ui.LastAccountRefresh).TotalSeconds -ge 3){Read-LauncherUiAccounts;$Ui.LastAccountRefresh=[datetime]::UtcNow}
+    Update-DiskBackupWarningUi
 }
 
 function Initialize-LauncherDarkControls {
@@ -8346,7 +7125,7 @@ function Show-LauncherUi {
     $top=New-Object Windows.Forms.TableLayoutPanel;$top.Dock='Fill';$top.ColumnCount=2;$top.RowCount=1
     $null=$top.ColumnStyles.Add([Windows.Forms.ColumnStyle]::new([Windows.Forms.SizeType]::Absolute,180));$null=$top.ColumnStyles.Add([Windows.Forms.ColumnStyle]::new([Windows.Forms.SizeType]::Percent,100))
     $brand=New-Object Windows.Forms.Panel;$brand.Dock='Fill';$top.Controls.Add($brand,0,0)
-    $title=New-Object Windows.Forms.Label;$Ui.Title=$title;$title.Text='launcher';$title.Font=[Drawing.Font]::new('Segoe UI',18,[Drawing.FontStyle]::Bold);$title.AutoSize=$true;$title.Location=[Drawing.Point]::new(0,7);$brand.Controls.Add($title)
+    $title=New-Object Windows.Forms.Label;$Ui.Title=$title;$title.Text='launcher';$title.Font=[Drawing.Font]::new('Segoe UI',14,[Drawing.FontStyle]::Bold);$title.AutoSize=$true;$title.Location=[Drawing.Point]::new(0,7);$brand.Controls.Add($title)
     $subtitle=New-Object Windows.Forms.Label;$subtitle.Text='Multi-instance control';$subtitle.AutoSize=$true;$subtitle.Location=[Drawing.Point]::new(3,43);$brand.Controls.Add($subtitle)
     $actions=New-Object Windows.Forms.FlowLayoutPanel;$Ui.Toolbar=$actions;$actions.Dock='Fill';$actions.WrapContents=$true;$top.Controls.Add($actions,1,0)
     foreach($entry in @(@('Start','Start tool'),@('Stop','Stop tool'),@('Save','Save settings'),@('Reload','Reload'),@('Reset','Reset emulators'))){
@@ -8367,18 +7146,14 @@ function Show-LauncherUi {
     $layout.Controls.Add($top,0,0)
     $policy=New-Object Windows.Forms.Panel;$policy.Dock='Fill'
     $forceClose=New-Object LauncherDarkButton;$Ui.ForceClose=$forceClose;$forceClose.Text='Force close LDPlayer';$forceClose.Size=[Drawing.Size]::new(180,32);$forceClose.Location=[Drawing.Point]::new(($policy.ClientSize.Width-180),0);$forceClose.Anchor='Top,Right';$policy.Controls.Add($forceClose)
-    $overwrite=New-Object Windows.Forms.CheckBox;$Ui.Overwrite=$overwrite
-    $overwrite.Visible=$false;$overwrite.Text='Game data is saved automatically';$overwrite.AutoSize=$true;$overwrite.Location=[Drawing.Point]::new(0,0);$policy.Controls.Add($overwrite)
+    ;
+    ;;;;
     $skipRepair=New-Object Windows.Forms.CheckBox;$Ui.SkipRepair=$skipRepair;$skipRepair.Text='Skip Repair all on next Start (one use)';$skipRepair.AutoSize=$true;$skipRepair.Location=[Drawing.Point]::new(0,5);$policy.Controls.Add($skipRepair)
     $arrange=New-Object LauncherDarkButton;$Ui.Arrange=$arrange;$arrange.Text='Arrange windows';$arrange.Size=[Drawing.Size]::new(160,32);$arrange.Location=[Drawing.Point]::new(($policy.ClientSize.Width-348),0);$arrange.Anchor='Top,Right';$policy.Controls.Add($arrange)
     $arrangeStatus=New-Object Windows.Forms.Label;$Ui.ArrangeStatus=$arrangeStatus;$arrangeStatus.Size=[Drawing.Size]::new(348,24);$arrangeStatus.Location=[Drawing.Point]::new(($policy.ClientSize.Width-348),67);$arrangeStatus.Anchor='Top,Right';$arrangeStatus.TextAlign='MiddleRight';$arrangeStatus.AutoEllipsis=$true;$policy.Controls.Add($arrangeStatus)
     $arrange.Add_Click({try{Start-LauncherUiWindowArrangement}catch{Set-LauncherUiProperty $Ui.ArrangeStatus Text $_.Exception.Message;Set-LauncherUiProperty $Ui.ArrangeStatus ForeColor ([Drawing.Color]::FromArgb(255,135,140))}})
     $progress=New-Object Windows.Forms.Label;$Ui.Progress=$progress;$progress.AutoSize=$true;$progress.Location=[Drawing.Point]::new(0,43);$policy.Controls.Add($progress)
     $backupLabel=New-Object Windows.Forms.Label;$Ui.Backup=$backupLabel;$backupLabel.AutoSize=$true;$backupLabel.Location=[Drawing.Point]::new(0,69);$policy.Controls.Add($backupLabel)
-    $mismatch=New-Object Windows.Forms.Label;$Ui.CookieMismatch=$mismatch
-    $mismatch.AutoSize=$true;$mismatch.Visible=$false;$mismatch.Location=[Drawing.Point]::new(0,121)
-    $mismatch.Font=[Drawing.Font]::new('Segoe UI',10,[Drawing.FontStyle]::Bold);$mismatch.ForeColor=[Drawing.Color]::FromArgb(255,135,140);$mismatch.BackColor=[Drawing.Color]::MistyRose
-    $policy.Controls.Add($mismatch)
     $workerDisplay=New-Object Windows.Forms.TextBox;$Ui.Workers=$workerDisplay
     $workerDisplay.ReadOnly=$true;$workerDisplay.Multiline=$true;$workerDisplay.WordWrap=$true;$workerDisplay.ScrollBars='Vertical'
     $workerDisplay.BorderStyle='None';$workerDisplay.BackColor=[Drawing.Color]::White;$workerDisplay.ForeColor=[Drawing.Color]::FromArgb(218,226,238)
@@ -8413,7 +7188,7 @@ function Show-LauncherUi {
     $grid.Add_EditingControlShowing({param($sender,$event) $event.Control.remove_TextChanged($Ui.ResizeEditorHandler);$event.Control.add_TextChanged($Ui.ResizeEditorHandler);Update-LauncherUiInputSizes -Part Setting})
     $Ui.ResizeEditorHandler=[EventHandler]{Update-LauncherUiInputSizes -Part Setting}
     $grid.Add_CellEndEdit({param($sender,$event) if($event.RowIndex -ge 0){$Ui.Settings.Rows[$event.RowIndex].MinimumHeight=28;$Ui.Settings.AutoResizeRow($event.RowIndex)}})
-    $accountsTab=New-Object Windows.Forms.TabPage;$accountsTab.Text='Game data';$tabs.TabPages.Add($accountsTab)
+    $accountsTab=New-Object Windows.Forms.TabPage;$accountsTab.Text='Emulator backups';$tabs.TabPages.Add($accountsTab)
     $accountLayout=New-Object Windows.Forms.TableLayoutPanel;$accountLayout.Dock='Fill';$accountLayout.ColumnCount=1;$accountLayout.RowCount=3
     $null=$accountLayout.RowStyles.Add([Windows.Forms.RowStyle]::new([Windows.Forms.SizeType]::Percent,100));$null=$accountLayout.RowStyles.Add([Windows.Forms.RowStyle]::new([Windows.Forms.SizeType]::Absolute,0));$null=$accountLayout.RowStyles.Add([Windows.Forms.RowStyle]::new([Windows.Forms.SizeType]::Absolute,54));$accountsTab.Controls.Add($accountLayout)
     $accounts=New-Object Windows.Forms.DataGridView;$Ui.Accounts=$accounts
@@ -8422,28 +7197,24 @@ function Show-LauncherUi {
     $accounts.AllowUserToResizeColumns=$false;$accounts.AllowUserToResizeRows=$false;$accounts.AutoSizeRowsMode='AllCells';$accounts.DefaultCellStyle.WrapMode='True'
     foreach($column in @(@('Id','Emulator',10),@('Package','App package',24),@('Local','Snapshot size',18),@('App','Last saved (UTC)',15),@('Status','Status',20),@('Message','Details',45))){$index=$accounts.Columns.Add($column[0],$column[1]);$accounts.Columns[$index].FillWeight=$column[2]}
     $accountLayout.Controls.Add($accounts,0,0)
-    $edit=New-Object Windows.Forms.FlowLayoutPanel;$edit.Dock='Fill';$edit.WrapContents=$false
-    $Ui.CookieEdit=$edit;$edit.Visible=$false
-    $inputLabel=New-Object Windows.Forms.Label;$inputLabel.Text='Replacement cookie:';$inputLabel.AutoSize=$true;$inputLabel.Margin=[Windows.Forms.Padding]::new(0,10,7,0);$edit.Controls.Add($inputLabel)
-    $input=New-Object Windows.Forms.TextBox;$Ui.CookieInput=$input;$input.UseSystemPasswordChar=$true;$input.Width=300;$input.MaxLength=16384;$input.Margin=[Windows.Forms.Padding]::new(0,7,8,0);$edit.Controls.Add($input)
-    $apply=New-Object Windows.Forms.Button;$Ui.ApplyCookie=$apply;$apply.Text='Save for selected app';$apply.Size=[Drawing.Size]::new(185,34);$apply.Margin=[Windows.Forms.Padding]::new(0,4,8,0);$edit.Controls.Add($apply)
-    $clear=New-Object Windows.Forms.Button;$Ui.ClearCookie=$clear;$clear.Text='Clear saved value';$clear.Size=[Drawing.Size]::new(160,34);$clear.Margin=[Windows.Forms.Padding]::new(0,4,0,0);$edit.Controls.Add($clear)
-    $input.Add_TextChanged({Update-LauncherUiInputSizes -Part Cookie});$edit.Add_SizeChanged({Update-LauncherUiInputSizes -Part Cookie})
-    $accountLayout.Controls.Add($edit,0,1)
-    $hint=New-Object Windows.Forms.Label;$Ui.CookieHint=$hint;$hint.Dock='Fill';$hint.Padding=[Windows.Forms.Padding]::new(2,7,2,0);$hint.ForeColor=[Drawing.Color]::FromArgb(153,169,190);$accountLayout.Controls.Add($hint,0,2)
+    ;;
+    ;
+    ;;;;
+    ;;;;;;
+    ;;;;;
+    ;;;;;
+    ;
+    
+    $hint=New-Object Windows.Forms.Label;$Ui.AppDataHint=$hint;$hint.Dock='Fill';$hint.Padding=[Windows.Forms.Padding]::new(2,7,2,0);$hint.ForeColor=[Drawing.Color]::FromArgb(153,169,190);$accountLayout.Controls.Add($hint,0,2)
     $logTab=New-Object Windows.Forms.TabPage;$logTab.Text='Live log';$Ui.LogTab=$logTab;$tabs.TabPages.Add($logTab)
     $logPanel=New-Object Windows.Forms.GroupBox;$logPanel.Text='Live log';$logPanel.Dock='Fill';$logPanel.Padding=[Windows.Forms.Padding]::new(7);$logTab.Controls.Add($logPanel)
     $logLayout=New-Object Windows.Forms.TableLayoutPanel;$logLayout.Dock='Fill';$logLayout.ColumnCount=1;$logLayout.RowCount=2
     $null=$logLayout.RowStyles.Add([Windows.Forms.RowStyle]::new([Windows.Forms.SizeType]::Absolute,38));$null=$logLayout.RowStyles.Add([Windows.Forms.RowStyle]::new([Windows.Forms.SizeType]::Percent,100));$logPanel.Controls.Add($logLayout)
     $logTools=New-Object Windows.Forms.FlowLayoutPanel;$logTools.Dock='Fill';$logTools.WrapContents=$false;$logLayout.Controls.Add($logTools,0,0)
     $copyAll=New-Object Windows.Forms.Button;$Ui.CopyLiveLog=$copyAll;$copyAll.Text='Copy all live logs';$copyAll.AutoSize=$true;$logTools.Controls.Add($copyAll)
-    $idLabel=New-Object Windows.Forms.Label;$idLabel.Text='Emulator ID:';$idLabel.AutoSize=$true;$idLabel.Margin=[Windows.Forms.Padding]::new(12,7,3,0);$logTools.Controls.Add($idLabel)
-    $logId=New-Object Windows.Forms.NumericUpDown;$Ui.LogEmulatorId=$logId;$logId.Minimum=0;$logId.Maximum=2147483647;$logId.Width=65;$logId.Margin=[Windows.Forms.Padding]::new(3,4,5,0);$logTools.Controls.Add($logId)
-    $copyEmulator=New-Object Windows.Forms.Button;$Ui.CopyEmulatorLog=$copyEmulator;$copyEmulator.Text='Copy emulator logs';$copyEmulator.AutoSize=$true;$logTools.Controls.Add($copyEmulator)
     $copyStatus=New-Object Windows.Forms.Label;$Ui.LogCopyStatus=$copyStatus;$copyStatus.AutoSize=$true;$copyStatus.Margin=[Windows.Forms.Padding]::new(8,7,0,0);$copyStatus.ForeColor=[Drawing.Color]::FromArgb(153,169,190);$logTools.Controls.Add($copyStatus)
     $log=New-Object Windows.Forms.RichTextBox;$Ui.Log=$log;$log.Dock='Fill';$log.ReadOnly=$true;$log.Font=[Drawing.Font]::new('Consolas',10);$log.BackColor=[Drawing.Color]::FromArgb(25,29,35);$log.ForeColor=[Drawing.Color]::Gainsboro;$log.BorderStyle='None';$logLayout.Controls.Add($log,0,1)
     $copyAll.Add_Click({try{Copy-LauncherUiLiveLog}catch{Set-LauncherUiProperty $Ui.LogCopyStatus Text $_.Exception.Message}})
-    $copyEmulator.Add_Click({try{Start-LauncherUiEmulatorLogCopy}catch{Set-LauncherUiProperty $Ui.LogCopyStatus Text $_.Exception.Message}})
     $status=New-Object Windows.Forms.Label;$Ui.Status=$status;$status.Dock='Fill';$status.Padding=[Windows.Forms.Padding]::new(2,4,0,0);$layout.Controls.Add($status,0,3)
     $Ui.Start.Add_Click({try{Start-LauncherUiRun}catch{Add-LauncherUiLog ($_.Exception.Message+"`r`n");[Windows.Forms.MessageBox]::Show($_.Exception.Message,'Could not start',[Windows.Forms.MessageBoxButtons]::OK,[Windows.Forms.MessageBoxIcon]::Warning)|Out-Null}})
     $Ui.Stop.Add_Click({try{Stop-LauncherUiRun;Update-LauncherUi}catch{[Windows.Forms.MessageBox]::Show('The stop request could not be sent. Try again.','Stop tool')|Out-Null}})
@@ -8452,12 +7223,10 @@ function Show-LauncherUi {
     $Ui.Save.Add_Click({try{Save-LauncherUiSettings;Add-LauncherUiLog "Settings saved.`r`n"}catch{[Windows.Forms.MessageBox]::Show($_.Exception.Message,'Settings')|Out-Null}})
     $Ui.Reload.Add_Click({try{Read-LauncherUiSettings;Read-LauncherUiAccounts}catch{[Windows.Forms.MessageBox]::Show($_.Exception.Message,'Reload')|Out-Null}})
     $Ui.Reset.Add_Click({try{Confirm-LauncherUiReset}catch{[Windows.Forms.MessageBox]::Show($_.Exception.Message,'Reset emulators')|Out-Null}})
-    $Ui.ApplyCookie.Add_Click({try{Save-LauncherUiCookie}catch{[Windows.Forms.MessageBox]::Show($_.Exception.Message,'Saved cookie')|Out-Null}})
-    $Ui.ClearCookie.Add_Click({
-        if([Windows.Forms.MessageBox]::Show('Clear only this saved file entry? The app cookie is unchanged and may be captured again at startup.','Clear saved value',[Windows.Forms.MessageBoxButtons]::YesNo,[Windows.Forms.MessageBoxIcon]::Question) -eq [Windows.Forms.DialogResult]::Yes){try{Save-LauncherUiCookie -Clear}catch{[Windows.Forms.MessageBox]::Show($_.Exception.Message,'Saved cookie')|Out-Null}}
-    })
-    $accounts.Add_SelectionChanged({if(-not $Ui.RefreshingAccounts){$Ui.CookieInput.Clear()}})
-    $accounts.Add_CellDoubleClick({param($sender,$event) if($event.RowIndex -ge 0 -and $Ui.CookieInput.Enabled){$Ui.CookieInput.Focus()|Out-Null}})
+    
+    
+    
+    
     $actions.Add_SizeChanged({if($Ui.Form.IsHandleCreated -and -not $Ui.Form.IsDisposed){$null=$Ui.Form.BeginInvoke([Action]{Update-LauncherUiToolbarHeight})}})
     $form.Add_Shown({Update-LauncherUiInputSizes;Update-LauncherUiToolbarHeight});$form.Add_Resize({Update-LauncherUiInputSizes;Update-LauncherUiToolbarHeight})
     $form.Add_FormClosing({
@@ -8477,7 +7246,6 @@ function Show-LauncherUi {
         $null=$form.ShowDialog()
     }finally{
         $timer.Stop();$timer.Dispose();$form.Dispose()
-        if($Ui.LogReadTask){$Ui.LogReadTask.Worker.Stop();$Ui.LogReadTask.Worker.Dispose()}
         if($Ui.ArrangeTask){$Ui.ArrangeTask.Worker.Stop();$Ui.ArrangeTask.Worker.Dispose()}
         if($Ui.ForceCloseTask){$Ui.ForceCloseTask.Worker.Stop();$Ui.ForceCloseTask.Worker.Dispose()}
         if($Ui.LogArchiveWriter){$Ui.LogArchiveWriter.Dispose();[IO.File]::Delete($Ui.LogArchivePath)}
