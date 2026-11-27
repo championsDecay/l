@@ -141,6 +141,21 @@ function Format-LauncherLogReason {
     }
     return $message
 }
+function Register-AppAttemptFailure {
+    param([string]$Package=$Config.GamePackage,[string]$Reason,[string]$AttemptKey='')
+    Sync-AppCrashBoot -BootIdentity ([long]$script:CurrentEmulatorInstance.ProcessId)
+    if(-not $script:AppAttemptFailureCounts){$script:AppAttemptFailureCounts=@{}}
+    if(-not $script:AppFailureLastAttempt){$script:AppFailureLastAttempt=@{}}
+    if(-not $script:AppFailureLastReason){$script:AppFailureLastReason=@{}}
+    if($AttemptKey -and $script:AppFailureLastAttempt[$Package] -ceq $AttemptKey){return}
+    if($AttemptKey){$script:AppFailureLastAttempt[$Package]=$AttemptKey}
+    $count=1+[int]$script:AppAttemptFailureCounts[$Package];$script:AppAttemptFailureCounts[$Package]=$count
+    $script:AppFailureLastReason[$Package]=$Reason
+    $limit=2;if($Config.AppAttemptFailureLimit){$limit=[int]$Config.AppAttemptFailureLimit}
+    $Config=$Config.Clone();$Config.GamePackage=$Package
+    Write-FlowStatus "Failed attempt $count/${limit}: $Reason" -Key Failure
+    if($count -ge $limit){$script:AppAttemptReplacementPending=$Package}
+}
 function Get-HybridSavedAccounts {
     $root=Get-DiskBackupRoot $Config
     $selection=(@($Config.LdPlayerIds|Sort-Object -Unique) -join ',')+'|'+($Config.GamePackages -join ',')
@@ -364,9 +379,20 @@ function Get-HybridPresence {
     $ids=[long[]]@($accounts.Values|Sort-Object -Unique)
     return [LauncherPcPresence]::Get([long]$accounts[$key],$ids,[math]::Max(3,$Config.GameCheckInterval),[string]$Config.StopFilePath)
 }
+function Register-GameAttemptFailure {
+    param([string]$Reason='Game attempt timed out.')
+    $key=Get-AppAttemptFailureKey
+    if(-not $key){return}
+    Register-AppAttemptFailure -Reason $Reason -AttemptKey $key
+    if($script:AppAttemptReplacementPending){
+        $limit=2;if($Config.AppAttemptFailureLimit){$limit=[int]$Config.AppAttemptFailureLimit}
+        Request-NoRootReplacement "App/game attempt limit reached ($($script:AppAttemptFailureCounts[$Config.GamePackage])/$limit): $Reason"
+    }
+}
 function Reset-HybridAppForRecovery {
     param([string]$Package,$App,[string]$Reason)
-    $App.Ready=$false;$App.LinkSentUtc=$null;$App.JoiningUtc=$null;$App.Opened=$false;$App.OpenedUtc=$null;$App.OpenRequestUtc=$null;$App.NegativeCount=0;$App.LastNegativeTicks=0L;$App.RecoveryCheckUtc=$null
+    if($script:PoolRole -eq 'Setup'){Register-GameAttemptFailure -Reason $Reason}
+    $App.Ready=$false;$App.AttemptId=$null;$App.LinkSentUtc=$null;$App.JoiningUtc=$null;$App.Opened=$false;$App.OpenedUtc=$null;$App.OpenRequestUtc=$null;$App.NegativeCount=0;$App.LastNegativeTicks=0L;$App.RecoveryCheckUtc=$null
     $script:AppWindowSnapshotTicks=0;$script:HybridCapture=$null
     $script:PoolActivePackage=$Package;$script:RecoveryScope='Game'
     if($script:PoolRole -eq 'Monitor'){
@@ -444,9 +470,18 @@ function Get-HybridAppState {
     param($Instance)
     if($script:HybridBoot -ne $Instance.ProcessId -or -not $script:HybridApps){
         $script:HybridBoot=$Instance.ProcessId;$script:HybridApps=@{};$script:HybridPresenceSamples=@{}
-        foreach($package in $Config.GamePackages){$script:HybridApps[$package]=@{Ready=$false;LinkSentUtc=$null;JoiningUtc=$null;LastState='';LastNegativeTicks=0L;NegativeCount=0;Opened=$false;OpenedUtc=$null;OpenRequestUtc=$null;RecoveryCheckUtc=$null}}
+        foreach($package in $Config.GamePackages){$script:HybridApps[$package]=@{Ready=$false;AttemptId=$null;LinkSentUtc=$null;JoiningUtc=$null;LastState='';LastNegativeTicks=0L;NegativeCount=0;Opened=$false;OpenedUtc=$null;OpenRequestUtc=$null;RecoveryCheckUtc=$null}}
     }
     return $script:HybridApps
+}
+function Get-AppAttemptFailureKey {
+    param([string]$Package=$Config.GamePackage)
+    if(-not $script:HybridApps -or -not $script:HybridApps.ContainsKey($Package)){return ''}
+    $app=$script:HybridApps[$Package]
+    if($app.AttemptId){return [string]$app.AttemptId}
+    if($app.LinkSentUtc){return 'Join|'+$app.LinkSentUtc.Ticks}
+    if($app.OpenRequestUtc){return 'Open|'+$app.OpenRequestUtc.Ticks}
+    return ''
 }
 function Get-HybridMarkerBounds {
     param([string]$Windows,[string]$Package)
@@ -528,7 +563,7 @@ function Test-NoRootAppCrashLimit {
         $count=[int]$script:AppCrashCounts[$package]
         $script:PendingInstanceReplacement=$true
         Set-EmulatorLiveObservation -AppState Crashed -Package $package
-        Request-NoRootReplacement "$package reached the configured crash limit ($count/$($Config.AppCrashLimit))."
+        Request-NoRootReplacement "Android crash limit reached ($count/$($Config.AppCrashLimit))."
     }
 }
 function Save-OfflineEmulatorBackup {
@@ -1197,7 +1232,7 @@ function Read-FlowConfig {
         AutoRestartHours = '0'; PostSyncDelay = '20'
         
          SkipRepairNextStart = '0'
-        CloudflareTimeoutLimit = '2'; InstanceOpenTimeoutLimit = '2'; GameOpenTimeoutLimit = '2'; AppCrashLimit = '2'
+        CloudflareTimeoutLimit = '2'; InstanceOpenTimeoutLimit = '2'; GameOpenTimeoutLimit = '2'; AppCrashLimit = '2'; AppAttemptFailureLimit = '2'
         PackageCheckFailuresBeforeRestart = '2'; PackageCheckRecoveryCyclesBeforeRestore = '2'; PackageCheckRetryDelay = '10'
         MaxReplacingInstances = '1'; RestoreBackupFile = ''; RecoveryMode = 'Backup'; RecoveryTemplateId = '0'; ResetInstanceCount = '20'
         MaxInstanceLaunchAttempts = '3'; MaxCloudflareAttempts = '0'
@@ -1288,7 +1323,7 @@ function Read-FlowConfig {
     if ($values.MonitorGame -gt 1) { throw 'MonitorGame must be 0 (off) or 1 (on).' }
     
     if ($values.SkipRepairNextStart -gt 1) { throw 'SkipRepairNextStart must be 0 (off) or 1 (on).' }
-    foreach($key in @('CloudflareTimeoutLimit','InstanceOpenTimeoutLimit','GameOpenTimeoutLimit','AppCrashLimit','MaxReplacingInstances','PackageCheckFailuresBeforeRestart','PackageCheckRecoveryCyclesBeforeRestore')){
+    foreach($key in @('CloudflareTimeoutLimit','InstanceOpenTimeoutLimit','GameOpenTimeoutLimit','AppCrashLimit','AppAttemptFailureLimit','MaxReplacingInstances','PackageCheckFailuresBeforeRestart','PackageCheckRecoveryCyclesBeforeRestore')){
         $number=0
         if(-not [int]::TryParse($values[$key],[ref]$number) -or $number -lt 1 -or $number -gt 1000){throw "$key must be a whole number from 1 to 1000."}
         $values[$key]=$number
@@ -2608,6 +2643,8 @@ function Invoke-AndroidAnrWait {
 
 function Reset-AppCrashTracking {
     $script:AppCrashBoot=0;$script:AppCrashCounts=@{};$script:AppCrashVisible=@{};$script:AppCrashRestartPending=$null
+    $script:AppFailureLastAttempt=@{};$script:AppFailureLastReason=@{}
+    $script:AppAttemptFailureCounts=@{};$script:AppAttemptReplacementPending=$null
     $script:AppCrashWindowCacheTicks=0;$script:AppCrashWindowCache=@()
 }
 
@@ -2618,13 +2655,20 @@ function Sync-AppCrashBoot {
 
 function Reset-JoinedAppCrashCount {
     param([string]$Package=$Config.GamePackage)
-    if(-not $script:AppCrashCounts -or [int]$script:AppCrashCounts[$Package] -le 0){return}
-    $previous=[int]$script:AppCrashCounts[$Package]
-    $script:AppCrashCounts.Remove($Package)
+    $previous=if($script:AppCrashCounts){[int]$script:AppCrashCounts[$Package]}else{0}
+    $attempts=if($script:AppAttemptFailureCounts){[int]$script:AppAttemptFailureCounts[$Package]}else{0}
+    if($script:AppCrashCounts){$script:AppCrashCounts.Remove($Package)}
     if($script:AppCrashVisible){$script:AppCrashVisible.Remove($Package)}
+    if($script:AppFailureLastAttempt){$script:AppFailureLastAttempt.Remove($Package)}
+    if($script:AppFailureLastReason){$script:AppFailureLastReason.Remove($Package)}
+    if($script:AppAttemptFailureCounts){$script:AppAttemptFailureCounts.Remove($Package)}
+    if($script:AppAttemptReplacementPending -ceq $Package){$script:AppAttemptReplacementPending=$null}
+    if($script:HybridApps -and $script:HybridApps.ContainsKey($Package)){$script:HybridApps[$Package].AttemptId=$null}
     if($script:AppCrashRestartPending -ceq $Package){$script:AppCrashRestartPending=$null}
-    $Config=$Config.Clone();$Config.GamePackage=$Package
-    Write-FlowStatus "Game join confirmed for $Package. Reset its crash count from $previous to 0."
+    if($previous -gt 0 -or $attempts -gt 0){
+        $Config=$Config.Clone();$Config.GamePackage=$Package
+        Write-FlowStatus "Joined successfully. Attempt and crash counts reset to 0." -Key Failure
+    }
 }
 
 function Update-AppCrashObservations {
@@ -2639,8 +2683,12 @@ function Update-AppCrashObservations {
             $script:AppCrashVisible[$package]=$true
             $count=1+[int]$script:AppCrashCounts[$package];$script:AppCrashCounts[$package]=$count
             $Config.GamePackage=$package
-            Write-FlowStatus "Android keeps-stopping dialog for ${package}: crash count $count/$limit."
+            Write-FlowStatus "Android crash $count/${limit}." -Key Crash
             if($count -ge $limit){$script:AppCrashRestartPending=$package}
+            if($script:HybridApps -and $script:HybridApps.ContainsKey($package)){
+                $app=$script:HybridApps[$package]
+                $app.AttemptId=$null;$app.LinkSentUtc=$null;$app.OpenRequestUtc=$null;$app.JoiningUtc=$null
+            }
         }
     }
 }
@@ -4528,9 +4576,10 @@ function Set-EmulatorRestoreRequired {
 }
 
 function Register-FlowStageTimeout {
-    param([ValidateSet('Cloudflare','Instance','Game')][string]$Stage)
+    param([ValidateSet('Cloudflare','Instance','Game')][string]$Stage,[string]$Reason='Game attempt timed out.')
     
-    if($Stage -in @('Game','Instance')){return}
+    if($Stage -eq 'Game'){Register-GameAttemptFailure -Reason $Reason;return}
+    if($Stage -eq 'Instance'){return}
     if(-not $Config.RestoreBackupPath){return}
     if($null -eq $script:FlowTimeoutCounts){$script:FlowTimeoutCounts=@{}}
     $key=$Stage
@@ -5087,6 +5136,7 @@ function Invoke-ResilientEmulatorFlow {
                     $reason=if($state -eq 'Unknown' -and $sample -and -not $sample.Available){' '+$sample.Error}else{''}
                     $label=if($state -eq 'Minimized'){'Hidden'}else{$state}
                     if($script:PoolRole -eq 'Monitor'){
+                        if(-not $app.AttemptId){$app.AttemptId=[guid]::NewGuid().ToString('N')}
                         $app.RecoveryCheckUtc=$null
                         Write-FlowStatus ("$label. Queued for a setup check (${timeout}s)."+$reason) -Key Status
                         Assert-PoolSetupTurn
@@ -5101,19 +5151,20 @@ function Invoke-ResilientEmulatorFlow {
                             Wait-FlowPause ([int][math]::Min([math]::Max(1,$Config.PollInterval),[math]::Max(1,[math]::Ceiling($timeout-$elapsed))))
                             continue
                         }
+                        if($state -ne 'Closed' -and -not $app.AttemptId){$app.AttemptId=[guid]::NewGuid().ToString('N')}
                         Reset-HybridAppForRecovery $package $app "No usable app state for ${timeout}s."
                         $state='Closed'
                     }
                 }else{
                     $app.RecoveryCheckUtc=$null
                 }
-                if($state -eq 'InGame'){$app.Ready=$true;$app.LinkSentUtc=$null;$app.JoiningUtc=$null;$app.OpenRequestUtc=$null;$app.NegativeCount=0;Reset-FlowStageTimeout -Stage Game;break}
+                if($state -eq 'InGame'){Reset-JoinedAppCrashCount -Package $package;$app.Ready=$true;$app.LinkSentUtc=$null;$app.JoiningUtc=$null;$app.OpenRequestUtc=$null;$app.NegativeCount=0;Reset-FlowStageTimeout -Stage Game;break}
                     if($state -in @('Closed','Minimized','Crashed','NotResponding')){
                         if($script:PoolRole -eq 'Monitor'){Reset-HybridAppForRecovery $package $app "App is $state."}
                         if($state -eq 'Crashed'){Dismiss-AndroidAppCrashDialog -Package $package;$script:AppWindowSnapshotTicks=0;$script:NoRootCrashCheckTicks=0}
                         $openTimeout=60;if($Config.LauncherOpenTimeout){$openTimeout=$Config.LauncherOpenTimeout}
                         if($app.OpenRequestUtc -and ([datetime]::UtcNow-$app.OpenRequestUtc).TotalSeconds -ge $openTimeout){
-                            Register-FlowStageTimeout -Stage Game
+                            Register-FlowStageTimeout -Stage Game -Reason 'App opening timed out.'
                             Reset-HybridAppForRecovery $package $app 'The game app did not become visible before its opening timeout.'
                             $watch.Restart()
                         }
@@ -5122,6 +5173,7 @@ function Invoke-ResilientEmulatorFlow {
                             Enter-EmulatorLoadingSlot
                             if($state -eq 'NotResponding'){Invoke-Ld -Arguments @('killapp','--index',"$InstanceIndex",'--packagename',$package)|Out-Null}
                             $app.OpenRequestUtc=[datetime]::UtcNow;$app.OpenedUtc=$app.OpenRequestUtc
+                            $app.AttemptId=[guid]::NewGuid().ToString('N')
                             Invoke-Ld -Arguments @('runapp','--index',"$InstanceIndex",'--packagename',$package)|Out-Null
                             $app.Opened=$true
                         }
@@ -5137,10 +5189,11 @@ function Invoke-ResilientEmulatorFlow {
                             if(-not $app.LinkSentUtc){
                                 if(-not $Config.ServerLink){throw 'No server link is assigned to this emulator.'}
                                 Enter-EmulatorLoadingSlot
+                                if(-not $app.AttemptId){$app.AttemptId=[guid]::NewGuid().ToString('N')}
                                 $app.LinkSentUtc=[datetime]::UtcNow;$app.JoiningUtc=$null
                                 $null=Open-ServerLinkWithRetry
                             }elseif(([datetime]::UtcNow-$app.LinkSentUtc).TotalSeconds -ge $Config.GameHomeTimeout){
-                                Register-FlowStageTimeout -Stage Game
+                                Register-FlowStageTimeout -Stage Game -Reason 'Server link did not start a game before the Home timeout.'
                                 Reset-HybridAppForRecovery $package $app 'Home persisted past the server-link timeout.'
                                 $watch.Restart()
                             }
@@ -5154,7 +5207,7 @@ function Invoke-ResilientEmulatorFlow {
                         if(-not $app.JoiningUtc){$app.JoiningUtc=[datetime]::UtcNow}
                         if($script:PoolRole -eq 'Monitor'){Assert-PoolSetupTurn}
                         if(([datetime]::UtcNow-$app.JoiningUtc).TotalSeconds -ge $Config.GameJoinTimeout){
-                            Register-FlowStageTimeout -Stage Game
+                            Register-FlowStageTimeout -Stage Game -Reason 'Game join timed out; readiness marker was not found.'
                             Reset-HybridAppForRecovery $package $app 'The local readiness marker was not found before the join timeout.'
                             $watch.Restart()
                         }
@@ -6376,6 +6429,7 @@ function Clear-LauncherRunState {
 
 function Read-LauncherUiSettings {
     $values=Read-LauncherUiConfig $Ui.ConfigPath
+    if(-not $values.Contains('AppAttemptFailureLimit')){$values['AppAttemptFailureLimit']='2'}
     if(-not $values.Contains('AppStateRecoveryTimeout')){$values['AppStateRecoveryTimeout']='10'}
     if(-not $values.Contains('ResetInstanceCount')){$values['ResetInstanceCount']='20'}
     if(-not $values.Contains('InstancesPerRow')){$values['InstancesPerRow']='5'}
@@ -6387,7 +6441,7 @@ function Read-LauncherUiSettings {
 
     if(-not $values.Contains('RecoveryMode')){$values['RecoveryMode']='Backup'}
     if(-not $values.Contains('RecoveryTemplateId')){$values['RecoveryTemplateId']='0'}
-    $labels=@{AppStateRecoveryTimeout='Unknown/hidden/closed app timeout (seconds)';GamePackages='Game app packages';MaxLoadingInstances='Emulators loading at once';MaxReplacingInstances='Instance replacements at once';CloudflareTimeoutLimit='VPN timeouts before replacement';InstanceOpenTimeoutLimit='Startup timeouts before replacement';GameOpenTimeoutLimit='Game timeouts before replacement';RestoreBackupFile='Restore backup (.ldbk)';AutoRestartHours='Restart after (hours)';PostSyncDelay='Pause after disk sync (seconds)';ExcludedLdPlayerIds='Excluded emulator IDs';LdPlayerInstallPath='LDPlayer installation folder';GameCheckInterval='Game check interval (seconds)';GameHomeTimeout='Home timeout after link (seconds)';GameJoinTimeout='Join timeout (seconds)';LauncherOpenTimeout='Game app opening timeout (seconds)'}
+    $labels=@{AppStateRecoveryTimeout='Unknown/hidden/closed app timeout (seconds)';AppAttemptFailureLimit='Failed app/game attempts before replacement';GamePackages='Game app packages';MaxLoadingInstances='Emulators loading at once';MaxReplacingInstances='Instance replacements at once';CloudflareTimeoutLimit='VPN timeouts before replacement';InstanceOpenTimeoutLimit='Startup timeouts before replacement';GameOpenTimeoutLimit='Game timeouts before replacement';RestoreBackupFile='Restore backup (.ldbk)';AutoRestartHours='Restart after (hours)';PostSyncDelay='Pause after disk sync (seconds)';ExcludedLdPlayerIds='Excluded emulator IDs';LdPlayerInstallPath='LDPlayer installation folder';GameCheckInterval='Game check interval (seconds)';GameHomeTimeout='Home timeout after link (seconds)';GameJoinTimeout='Join timeout (seconds)';LauncherOpenTimeout='Game app opening timeout (seconds)'}
     $Ui.Settings.Rows.Clear()
     $labels['InstancesPerRow']='Instances per row'
     $labels['ResetInstanceCount']='Game emulators after reset (plus template 0)'
@@ -6403,7 +6457,7 @@ function Read-LauncherUiSettings {
     $labels['MaxLoadingInstancesAboveThreshold']='Loading limit above running threshold'
     $groups=[ordered]@{
         'Instances and workload'=@('LdPlayerInstallPath','LdConsolePath','GamePackages','MaxLoadingInstances','LoadingInstanceThreshold','MaxLoadingInstancesAboveThreshold','MaxReplacingInstances','EmulatorsPerServerLink','InstancesPerRow')
-        'Timeout and failure counts'=@('InstanceOpenTimeoutLimit','CloudflareTimeoutLimit','PackageCheckFailuresBeforeRestart','AppCrashLimit','MaxCloudflareAttempts','MaxServerLinkAttempts')
+        'Timeout and failure counts'=@('InstanceOpenTimeoutLimit','CloudflareTimeoutLimit','PackageCheckFailuresBeforeRestart','AppCrashLimit','AppAttemptFailureLimit','MaxCloudflareAttempts','MaxServerLinkAttempts')
         'Timeouts (seconds)'=@('LdPlayerOpenTimeout','CloudflareOpenTimeout','CloudflareConnectTimeout','LauncherOpenTimeout','GameJoinTimeout','GameHomeTimeout','AppStateRecoveryTimeout','CommandTimeout')
         'Check intervals and retry delays (seconds)'=@('GameCheckInterval','PollInterval','MinCheckDelay','RetryDelay','PackageCheckRetryDelay','CloudflarePollInterval','CloudflareRetryDelay','InstanceLaunchDelay','InstanceRelaunchDelay','LauncherRelaunchDelay')
         'Scheduled restart and shutdown'=@('AutoRestartHours','PostSyncDelay')
