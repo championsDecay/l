@@ -135,7 +135,7 @@ public static class LauncherPcPresence {
     static readonly HashSet<long> requested=new HashSet<long>();
     static bool busy;
     static DateTime next=DateTime.MinValue;
-    static string failure="Waiting for a PC presence response.";
+    static string failure="Waiting for a Roblox endpoint response.";
     static int failures;
     public static LauncherPresenceResult Get(long id,long[] ids,int interval,string stop){
         lock(gate){
@@ -179,21 +179,21 @@ public static class LauncherPcPresence {
                     using(WaitHandle wait=pending.AsyncWaitHandle){
                         var timer=Stopwatch.StartNew();
                         while(!wait.WaitOne(100)){
-                            if(File.Exists(stop)||timer.ElapsedMilliseconds>=10000){request.Abort();throw new IOException("PC presence request stopped or timed out.");}
+                            if(File.Exists(stop)||timer.ElapsedMilliseconds>=10000){request.Abort();throw new IOException("Roblox endpoint request stopped or timed out.");}
                         }
                     }
                     using(var response=(HttpWebResponse)request.EndGetResponse(pending)){
-                        if((int)response.StatusCode!=200)throw new IOException("PC presence response was not successful.");
+                        if((int)response.StatusCode!=200)throw new IOException("Roblox endpoint response was not successful.");
                         string json;
                         using(var reader=new StreamReader(response.GetResponseStream(),Encoding.UTF8)){
                             char[] buffer=new char[4096];var text=new StringBuilder();int n;
-                            while((n=reader.Read(buffer,0,buffer.Length))>0){text.Append(buffer,0,n);if(text.Length>1048576)throw new IOException("PC presence response exceeded its limit.");}
+                            while((n=reader.Read(buffer,0,buffer.Length))>0){text.Append(buffer,0,n);if(text.Length>1048576)throw new IOException("Roblox endpoint response exceeded its limit.");}
                             json=text.ToString();
                         }
                         var serializer=new JavaScriptSerializer();serializer.MaxJsonLength=1048576;
                         var root=serializer.DeserializeObject(json) as Dictionary<string,object>;object entries;
-                        if(root==null||!root.TryGetValue("userPresences",out entries))throw new IOException("PC presence response was incomplete.");
-                        var rows=entries as object[];if(rows==null)throw new IOException("PC presence response was incomplete.");
+                        if(root==null||!root.TryGetValue("userPresences",out entries))throw new IOException("Roblox endpoint response was incomplete.");
+                        var rows=entries as object[];if(rows==null)throw new IOException("Roblox endpoint response was incomplete.");
                         long ticks=DateTime.UtcNow.Ticks;
                         lock(gate){
                             foreach(long user in batch)results.Remove(user);
@@ -210,16 +210,16 @@ public static class LauncherPcPresence {
                     if(response!=null){using(response){
                         int status=(int)response.StatusCode,retry;
                         if(status==429){delay=60;if(Int32.TryParse(response.Headers["Retry-After"],out retry))delay=Math.Max(delay,Math.Min(3600,retry));}
-                        error="PC presence HTTP "+status+". Retrying without declaring a disconnect.";
-                    }}else error="PC presence connection failed. Retrying without declaring a disconnect.";
+                        error="Roblox endpoint HTTP "+status+". Retrying without declaring a disconnect.";
+                    }}else error="Roblox endpoint connection failed. Retrying without declaring a disconnect.";
                     throw new IOException(error);
                 }finally{request.Abort();}
             }
-        }catch(Exception){if(error.Length==0)error="PC presence is unavailable. Retrying without declaring a disconnect.";}
+        }catch(Exception){if(error.Length==0)error="Roblox endpoint is unavailable. Retrying without declaring a disconnect.";}
         finally{
             lock(gate){
                 if(error.Length>0){failures++;results.Clear();delay=Math.Max(delay,Math.Min(60,3*(1<<Math.Min(failures,4))));failure=error;}
-                else{failures=0;failure="Waiting for a PC presence response.";}
+                else{failures=0;failure="Waiting for a Roblox endpoint response.";}
                 next=DateTime.UtcNow.AddSeconds(delay);busy=false;
             }
         }
@@ -4000,7 +4000,7 @@ function Invoke-WorkerWithInstanceReplacement {
             ;;$script:LoadedAppDataCaptures=@{};;;;
             $script:VpnVerifiedBoot=0;$script:CloudflareUidCache=$null;$script:EmulatorUptimeProcessId=0;$script:StartupFailureCount=0;$script:GameLinkSentAt=@{}
             Clear-ProcessCheckCache
-            Write-FlowStatus "This worker now handles replacement $InstanceIndex. Continuing PC presence, local readiness-marker and root-off startup."
+            Write-FlowStatus "This worker now handles replacement $InstanceIndex. Continuing Roblox endpoint, local readiness-marker and root-off startup."
         }catch{
             if($script:PoolRole){
                 $package=[string]$_.Exception.Data['GamePackage'];if(-not $package){$package=$script:PoolActivePackage}
@@ -4892,7 +4892,7 @@ function Invoke-ResilientEmulatorFlow {
                 $waitingForJoin=$script:PoolRole -eq 'Setup' -and $null -ne $app.LinkSentUtc
                 $state=Get-LauncherSessionState -RequireReady:$waitingForJoin
                 if($state -cne $app.LastState){
-                    $checks=if($waitingForJoin){'PC presence + join marker/ADB'}else{'PC presence + Android/app state'}
+                    $checks=if($waitingForJoin){'Roblox endpoint + join marker/ADB'}else{'Roblox endpoint + Android/app state'}
                     Write-FlowStatus "Game status: $state ($checks).";$app.LastState=$state
                 }
                 if($state -in @('Unknown','Minimized','Closed')){
@@ -5246,7 +5246,7 @@ function Wait-ForLdPlayerRepairers {
 }
 
 
-function Invoke-StartupRepairPolicy {Write-Host 'launcher uses offline backups, root-free ADB checks, PC presence and the local readiness marker.'}
+function Invoke-StartupRepairPolicy {Write-Host 'launcher uses offline backups, root-free ADB checks, Roblox endpoint and the local readiness marker.'}
 
 function Repair-AllInstancesBeforeMainLoop {
     if(@(Get-PendingInstanceReplacements $Config).Count){Write-Host 'An instance replacement is pending. Skipping startup repair until its registration is completed.';return}
@@ -7081,7 +7081,7 @@ function Update-LauncherUi {
     Update-LauncherUiWorkerStatus -Running $busy -Record $record
     if($resetBusy){Set-LauncherUiProperty $Ui.Progress Text 'Reset in progress. Stop waits for the current disk operation to finish.'}
     elseif($busy -and $record){
-        Set-LauncherUiProperty $Ui.Progress Text 'Offline backups; PC presence and local readiness marker; root OFF.' 
+        Set-LauncherUiProperty $Ui.Progress Text 'Offline backups; Roblox endpoint and local readiness marker; root OFF.' 
     }elseif(-not $busy){Set-LauncherUiProperty $Ui.Progress Text ''}
     if($Ui.LastWasBusy -and -not $busy){
         if($Ui.Tabs){$Ui.Tabs.SelectedTab=$Ui.SettingsTab}
