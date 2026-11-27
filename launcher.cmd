@@ -21,7 +21,127 @@ powershell.exe -NoProfile -STA -NonInteractive %flowWindow% -Command "$content =
 set "flowExit=%ERRORLEVEL%"
 if not "%flowExit%"=="0" pause
 exit /b %flowExit%
-:LAUNCHER_POWERSHELLfunction Reset-HybridAppForRecovery {
+:LAUNCHER_POWERSHELLfunction Initialize-LauncherLogUiNative {
+    if('LauncherLogView' -as [type]){return}
+    Add-Type -ReferencedAssemblies @('System.dll','System.Core.dll','System.Xml.dll','System.Drawing.dll','System.Windows.Forms.dll') -TypeDefinition @'
+using System;
+using System.Collections.Concurrent;
+using System.Diagnostics;
+using System.IO;
+using System.Text;
+using System.Text.RegularExpressions;
+using System.Xml;
+using System.Drawing;
+using System.Runtime.InteropServices;
+using System.Windows.Forms;
+
+public static class LauncherLogView {
+    [StructLayout(LayoutKind.Sequential)]struct ScrollInfo {public uint cbSize,fMask;public int nMin,nMax;public uint nPage;public int nPos,nTrackPos;}
+    [DllImport("user32.dll")]static extern bool GetScrollInfo(IntPtr window,int bar,ref ScrollInfo info);
+    [DllImport("user32.dll",EntryPoint="SendMessageW")]static extern IntPtr PointMessage(IntPtr window,int message,IntPtr value,ref Point point);
+    [DllImport("user32.dll",EntryPoint="SendMessageW")]static extern IntPtr SendMessage(IntPtr window,int message,IntPtr value,IntPtr data);
+    public static bool AtBottom(RichTextBox box){
+        if(!box.IsHandleCreated||box.TextLength==0)return true;
+        var info=new ScrollInfo();info.cbSize=(uint)Marshal.SizeOf(typeof(ScrollInfo));info.fMask=0x17;
+        if(!GetScrollInfo(box.Handle,1,ref info))return box.GetCharIndexFromPosition(new Point(1,Math.Max(0,box.ClientSize.Height-2)))>=box.TextLength-2;
+        return info.nMax-info.nMin<=(int)info.nPage||info.nPos+(int)info.nPage>=info.nMax-1;
+    }
+    public static Point Position(RichTextBox box){var point=new Point();PointMessage(box.Handle,0x4DD,IntPtr.Zero,ref point);return point;}
+    public static void SetPosition(RichTextBox box,Point point){PointMessage(box.Handle,0x4DE,IntPtr.Zero,ref point);}
+    public static void Append(RichTextBox box,string text){
+        if(box==null||box.IsDisposed||String.IsNullOrEmpty(text))return;
+        bool bottom=AtBottom(box);Point scroll=Position(box);
+        int selection=box.SelectionStart,length=box.SelectionLength;
+        int anchor=box.GetCharIndexFromPosition(new Point(1,1));Point anchorScreen=box.GetPositionFromCharIndex(anchor);
+        SendMessage(box.Handle,0xB,IntPtr.Zero,IntPtr.Zero);
+        try{
+            box.AppendText(text);int removed=0;
+            if(box.TextLength>200000){
+                string all=box.Text;removed=Math.Max(0,all.Length-100000);int line=all.IndexOf('\n',removed);
+                if(line>=0&&line+1<all.Length)removed=line+1;
+                box.Text=all.Substring(removed);
+            }
+            if(bottom){box.Select(box.TextLength,0);box.ScrollToCaret();}
+            else{
+                int start=Math.Max(0,selection-removed),end=Math.Max(0,selection+length-removed);
+                box.Select(Math.Min(start,box.TextLength),Math.Min(Math.Max(0,end-start),Math.Max(0,box.TextLength-start)));
+                if(removed>0){
+                    int kept=Math.Max(0,anchor-removed);Point now=Position(box),location=box.GetPositionFromCharIndex(kept);
+                    scroll=new Point(scroll.X,Math.Max(0,now.Y+location.Y-(anchor>=removed?anchorScreen.Y:0)));
+                }
+                SetPosition(box,scroll);
+            }
+        }finally{SendMessage(box.Handle,0xB,new IntPtr(1),IntPtr.Zero);box.Invalidate();}
+    }
+}
+
+public sealed class LauncherOutputReader : IDisposable {
+    readonly ConcurrentQueue<string> lines=new ConcurrentQueue<string>();readonly object gate=new object();readonly Process process;
+    readonly StringBuilder stdoutXml=new StringBuilder(),stderrXml=new StringBuilder();StreamWriter writer;bool disposed;
+    public LauncherOutputReader(Process process,string logFile){
+        this.process=process;writer=new StreamWriter(new FileStream(logFile,FileMode.Append,FileAccess.Write,FileShare.ReadWrite),new UTF8Encoding(false));writer.AutoFlush=true;
+        process.OutputDataReceived+=ReceiveOutput;process.ErrorDataReceived+=ReceiveError;
+    }
+    static string Decode(string value){return Regex.Replace(value,@"_x([0-9A-Fa-f]{4})_",m=>((char)Convert.ToInt32(m.Groups[1].Value,16)).ToString());}
+    public static string ReadCliXml(string text){
+        var result=new StringBuilder();var settings=new XmlReaderSettings();settings.DtdProcessing=DtdProcessing.Prohibit;settings.XmlResolver=null;settings.MaxCharactersInDocument=2097152;
+        using(var reader=XmlReader.Create(new StringReader(text),settings)){
+            var document=new XmlDocument();document.XmlResolver=null;document.Load(reader);
+            foreach(XmlNode node in document.DocumentElement.ChildNodes){
+                var element=node as XmlElement;if(element==null)continue;
+                string stream=element.GetAttribute("S");
+                if(!stream.Equals("error",StringComparison.OrdinalIgnoreCase)&&!stream.Equals("warning",StringComparison.OrdinalIgnoreCase))continue;
+                var summary=element.SelectSingleNode("./*[local-name()='ToString']")??element.SelectSingleNode(".//*[local-name()='S' and @N='Message']");
+                string message=Decode(summary==null?element.InnerText:summary.InnerText).TrimEnd('\r','\n');
+                if(message.Length>0)result.AppendLine((stream.Equals("warning",StringComparison.OrdinalIgnoreCase)?"Warning: ":"")+message);
+            }
+        }
+        return result.ToString();
+    }
+    void ReceiveOutput(object sender,DataReceivedEventArgs e){Receive(e.Data,stdoutXml);}
+    void ReceiveError(object sender,DataReceivedEventArgs e){Receive(e.Data,stderrXml);}
+    void Receive(string data,StringBuilder buffer){
+        lock(gate){
+            if(disposed)return;
+            if(data==null){if(buffer.Length>0){buffer.Clear();lines.Enqueue("PowerShell output ended before it could be formatted. Full details are in worker.log."+Environment.NewLine);}return;}
+            try{writer.WriteLine(data);}catch(IOException){}
+            string trimmed=data.TrimStart();if(trimmed.StartsWith("#< CLIXML",StringComparison.Ordinal))return;
+            if(buffer.Length==0&&!trimmed.StartsWith("<Objs",StringComparison.Ordinal)){lines.Enqueue(data+Environment.NewLine);return;}
+            buffer.AppendLine(data);
+            if(buffer.Length>2097152){buffer.Clear();lines.Enqueue("PowerShell output was too large to format. Full details are in worker.log."+Environment.NewLine);return;}
+            if(data.IndexOf("</Objs>",StringComparison.Ordinal)<0)return;
+            try{string decoded=ReadCliXml(buffer.ToString());if(decoded.Length>0)lines.Enqueue(decoded);}
+            catch(XmlException){lines.Enqueue("PowerShell output could not be formatted. Full details are in worker.log."+Environment.NewLine);}
+            finally{buffer.Clear();}
+        }
+    }
+    public void Start(){process.BeginOutputReadLine();process.BeginErrorReadLine();}
+    public string Drain(){var text=new StringBuilder();string line;while(text.Length<262144&&lines.TryDequeue(out line))text.Append(line);return text.ToString();}
+    public void Dispose(){lock(gate){if(disposed)return;disposed=true;process.OutputDataReceived-=ReceiveOutput;process.ErrorDataReceived-=ReceiveError;writer.Dispose();}}
+}
+
+'@
+}
+function Format-LauncherLogReason {
+    param([string]$Message)
+    $message=$Message.TrimEnd([char[]]' .')
+    if($message -match '^LDPlayer command exceeded (\d+) seconds:\s*(.+)$'){
+        $seconds=$Matches[1];$command=$Matches[2]
+        $action=switch -Regex ($command){
+            'dumpsys.*window' {'App-window check';break}
+            'pm list|pm path' {'Package check';break}
+            'getprop|LAUNCHER_ADB_READY' {'ADB check';break}
+            '^list2' {'Emulator list check';break}
+            'screencap' {'Screen capture';break}
+            'runapp|am start' {'App opening';break}
+            'killapp|force-stop' {'App closing';break}
+            default {'LDPlayer command'}
+        }
+        return "$action timed out after ${seconds}s"
+    }
+    return $message
+}
+function Reset-HybridAppForRecovery {
     param([string]$Package,$App,[string]$Reason)
     $App.Ready=$false;$App.LinkSentUtc=$null;$App.JoiningUtc=$null;$App.Opened=$false;$App.OpenedUtc=$null;$App.OpenRequestUtc=$null;$App.NegativeCount=0;$App.LastNegativeTicks=0L;$App.RecoveryCheckUtc=$null
     $script:AppWindowSnapshotTicks=0;$script:HybridCapture=$null
@@ -36,7 +156,7 @@ exit /b %flowExit%
         $failure.Data['PoolNeedsSetup']=$true;throw $failure
     }
     Invoke-Ld -Arguments @('killapp','--index',"$InstanceIndex",'--packagename',$Package)|Out-Null
-    Write-FlowStatus ($Reason+' Closed the affected app; its setup turn will reopen it.')
+    Write-FlowStatus ($Reason+' App closed; reopening through setup.') -Key Recovery
 }
 function Get-HybridMarkerBounds {
     param([string]$Windows,[string]$Package)
@@ -210,12 +330,12 @@ public static class LauncherPcPresence {
                     if(response!=null){using(response){
                         int status=(int)response.StatusCode,retry;
                         if(status==429){delay=60;if(Int32.TryParse(response.Headers["Retry-After"],out retry))delay=Math.Max(delay,Math.Min(3600,retry));}
-                        error="Roblox endpoint HTTP "+status+". Retrying without declaring a disconnect.";
-                    }}else error="Roblox endpoint connection failed. Retrying without declaring a disconnect.";
+                        error="Roblox endpoint HTTP "+status+". Will retry.";
+                    }}else error="Roblox endpoint connection failed. Will retry.";
                     throw new IOException(error);
                 }finally{request.Abort();}
             }
-        }catch(Exception){if(error.Length==0)error="Roblox endpoint is unavailable. Retrying without declaring a disconnect.";}
+        }catch(Exception){if(error.Length==0)error="Roblox endpoint is unavailable. Will retry.";}
         finally{
             lock(gate){
                 if(error.Length>0){failures++;results.Clear();delay=Math.Max(delay,Math.Min(60,3*(1<<Math.Min(failures,4))));failure=error;}
@@ -885,7 +1005,7 @@ function Confirm-NoRootAdb {
     param([int]$BootIdentity,[ValidateRange(1,15)][int]$Seconds=15)
     if($BootIdentity -gt 0 -and $script:NoRootAdbCheckedBoot -eq $BootIdentity){return}
     Assert-PoolSetupTurn
-    Write-FlowStatus "Checking ADB before package verification (up to $Seconds seconds)..."
+    Write-FlowStatus "Checking ADB (up to ${Seconds}s)..."
     $watch=[Diagnostics.Stopwatch]::StartNew()
     while($watch.Elapsed.TotalSeconds -lt $Seconds){
         if(Test-FlowStopRequested){throw [OperationCanceledException]::new('Stopped during ADB readiness verification.')}
@@ -893,7 +1013,7 @@ function Confirm-NoRootAdb {
         $result=Invoke-NoRootNative @('adb','--index',"$InstanceIndex",'--command','shell echo LAUNCHER_ADB_READY') ([math]::Min(3,$remaining))
         if($result.Success -and $result.Output -ceq 'LAUNCHER_ADB_READY'){
             $script:NoRootAdbCheckedBoot=$BootIdentity
-            Write-FlowStatus 'ADB is responding. Continuing to package verification.'
+            Write-FlowStatus 'ADB ready.'
             return
         }
         $remaining=$Seconds-$watch.Elapsed.TotalSeconds
@@ -1343,15 +1463,11 @@ function Invoke-Ld {
 
 function New-LdCommandTimeoutError {
     param([string]$Message)
-    
-    
     if($script:PoolRole -and $InstanceIndex -ge 0 -and -not $script:ReplacementFileTransaction){
         $script:PendingEmulatorRestore=$Message
-        Write-FlowStatus ($Message+'. Instance replacement queued for only this emulator through the loading/replacement limits.')
+        Write-FlowStatus ('Replacement queued: '+(Format-LauncherLogReason $Message)+'.') -Key ReplacementReason -Emulator
         $signal=[OperationCanceledException]::new($Message)
-        $signal.Data['PoolNeedsSetup']=$true
-        $signal.Data['RestoreRequired']=$true
-        $signal.Data['LdCommandTimedOut']=$true
+        $signal.Data['PoolNeedsSetup']=$true;$signal.Data['RestoreRequired']=$true;$signal.Data['LdCommandTimedOut']=$true
         return $signal
     }
     return [TimeoutException]::new($Message)
@@ -1383,33 +1499,32 @@ function Get-InstanceInfo {
 }
 
 function Write-FlowStatus {
-    param([string]$Message)
+    param([string]$Message,[string]$Key='',[switch]$Emulator)
+    if(-not $Message){return}
+    $boot=if($script:CurrentEmulatorInstance){[string]$script:CurrentEmulatorInstance.ProcessId}else{[string]$script:NoRootReadyBoot}
+    $identity="$InstanceIndex|$boot"
+    if($script:FlowMessageIdentity -cne $identity -or -not $script:FlowMessages){$script:FlowMessageIdentity=$identity;$script:FlowMessages=@{}}
     $prefix="[LDPlayer $InstanceIndex]"
-    if ($Config.GamePackages.Count -gt 1) { $prefix+="[$($Config.GamePackage)]" }
+    if(-not $Emulator -and $Config.GamePackages.Count -gt 1){$prefix+="[$($Config.GamePackage)]"}
+    $channel=if($Key){$Key}else{'Last'}
+    $cacheKey="$prefix|$channel"
+    if($script:FlowMessages[$cacheKey] -ceq $Message){return}
+    if($Message -match '^Status:'){
+        foreach($oldKey in @($script:FlowMessages.Keys|Where-Object{$_ -like ($prefix+'|Retry*') -or $_ -ceq ($prefix+'|Recovery')})){$script:FlowMessages.Remove($oldKey)}
+    }
+    if($script:FlowMessages.Count -ge 128){$script:FlowMessages.Clear()}
+    $script:FlowMessages[$cacheKey]=$Message
     Write-Host "$prefix $Message"
 }
 
 function Write-WorkerRetryStatus {
     param([Exception]$Failure,[int]$RetrySeconds,[switch]$ReplacementActive)
-    
-    
     $Config=$Config.Clone()
-    $package=[string]$Failure.Data['GamePackage']
-    if(-not $package){$package=[string]$script:PoolActivePackage}
+    $package=[string]$Failure.Data['GamePackage'];if(-not $package){$package=[string]$script:PoolActivePackage}
     if($package -and @($Config.GamePackages) -ccontains $package){$Config.GamePackage=$package}
-    $delay=[math]::Max(1,$RetrySeconds)
-    $reason=$Failure.Message.TrimEnd([char[]]' .')
-    if($ReplacementActive){$label='Instance replacement attempt failed'}
-    elseif($Failure.Data['AppCacheCleanupFailed']){$label='Crash cache cleanup incomplete'}
-    elseif($Failure.Data['InstanceInventoryUnavailable']){$label='Emulator inventory check incomplete'}
-    elseif($Failure.Data['GameStatusReadFailed']){$label='Game-status check incomplete'}
-    elseif($Failure.Data['PackageCheckUnavailable']){$label='Installed-package check incomplete'}
-    elseif($Failure.Data['RestoreRequired'] -or $Failure.Data['LdCommandTimedOut']){$label='Emulator recovery requested'}
-    elseif($script:RecoveryScope -eq 'VPN'){$label='VPN check failed'}
-    elseif($script:RecoveryScope -in @('Startup','Packages')){$label='Emulator setup check failed'}
-    elseif($script:RecoveryScope -eq 'Game'){$label='App check failed'}
-    else{$label='Worker check failed'}
-    Write-FlowStatus "$label. Retrying in $delay seconds. Reason: $reason."
+    $delay=[math]::Max(1,$RetrySeconds);$reason=Format-LauncherLogReason $Failure.Message
+    $label=if($ReplacementActive){'Replacement paused'}elseif($Failure.Data['InstanceInventoryUnavailable']){'Emulator list unavailable'}elseif($Failure.Data['GameStatusReadFailed']){'App status unavailable'}elseif($Failure.Data['PackageCheckUnavailable']){'Package check incomplete'}elseif($Failure.Data['RestoreRequired'] -or $Failure.Data['LdCommandTimedOut']){'Recovery pending'}elseif($script:RecoveryScope -eq 'VPN'){'VPN check failed'}elseif($script:RecoveryScope -in @('Startup','Packages')){'Setup paused'}else{'App check failed'}
+    Write-FlowStatus "$label. Retrying every ${delay}s: $reason." -Key ("Retry|$ReplacementActive|$($script:RecoveryScope)")
 }
 
 function Set-BootRequestPhase {
@@ -1545,10 +1660,10 @@ function Wait-LoadingActionPermission {
     while(-not (Test-LoadingActionPermission)){
         Assert-PoolSetupTurn
         if(Test-FlowStopRequested){throw [OperationCanceledException]::new('Stopped while waiting for the current loading limit.')}
-        if(-not $reported){Write-FlowStatus 'Waiting before the next loading action: the current running-count limit must allow this slot. Existing games remain open.';$reported=$true}
+        if(-not $reported){Write-FlowStatus 'Loading limit reached. This emulator is waiting.';$reported=$true}
         Start-Sleep -Milliseconds 500
     }
-    if($reported){Write-FlowStatus 'The current loading limit allows this slot. Continuing setup.'}
+    if($reported){Write-FlowStatus 'Loading slot available. Continuing setup.'}
 }
 
 function Get-BootInventory {
@@ -1620,7 +1735,7 @@ function Update-BootScheduler {
     $Scheduler.ReadFailureReported=$false
     $policy=Get-LoadingLimitPolicy $settings $inventory
     if($policy.Dynamic -and $Scheduler.CurrentLimit -ne $policy.Limit){
-        Write-Host "Loading limit is now $($policy.Limit): $($policy.RunningCount) emulators running (threshold $($policy.Threshold); $($policy.LowLimit) at/below, $($policy.HighLimit) above). Excess workers return their emulators to the queue before their next setup action; current joins may finish."
+        Write-Host "Loading limit: $($policy.Limit). Running: $($policy.RunningCount). Threshold: $($policy.Threshold)."
     }
     $Scheduler.CurrentLimit=$policy.Limit;$Scheduler.RunningCount=$policy.RunningCount
     $Scheduler.Inventory=$inventory;$Scheduler.InventoryTicks=[datetime]::UtcNow.Ticks
@@ -1669,7 +1784,7 @@ function Update-BootScheduler {
         throw
     }
     $null=$loading.Add($id)
-    Write-Host "LDPlayer $id received a setup slot ($($loading.Count)/$($policy.Limit)). The slot stays occupied until app-data maintenance finishes."
+    Write-Host "[LDPlayer $id] Setup slot granted ($($loading.Count)/$($policy.Limit))."
 }
 
 function Request-EmulatorLoadingSlot {
@@ -1683,7 +1798,7 @@ function Request-EmulatorLoadingSlot {
     $grantPath=Join-Path $directory ("boot-grant-$InstanceIndex.json")
     $policy=Get-LoadingLimitPolicy $Config
     $limitText=if($policy.Dynamic){"$($policy.LowLimit) slots at/below $($policy.Threshold) running, $($policy.HighLimit) above"}else{"maximum $($policy.LowLimit)"}
-    Write-FlowStatus "Waiting for an emulator setup slot ($limitText; lower IDs have priority)..."
+    Write-FlowStatus 'Waiting for a setup slot.' -Key SetupQueue -Emulator
     while ($true) {
         Assert-PoolSetupTurn
         try {
@@ -1793,7 +1908,7 @@ function Close-AppsBeforeEmulatorRestart {
     if ($result -match 'APP_CLOSE_FAILED:') { throw 'A running app did not close yet. Emulator restart will retry before closing LDPlayer.' }
     Invoke-Android 'shell sync' | Out-Null
     if ($Config.PostSyncDelay -gt 0) {
-        Write-FlowStatus "Sync finished. Waiting $($Config.PostSyncDelay) seconds before closing LDPlayer..."
+        Write-FlowStatus "Apps closed and disk synced. Closing emulator in $($Config.PostSyncDelay)s..."
         Start-Sleep -Seconds $Config.PostSyncDelay
     }
     Start-Sleep -Seconds ([math]::Max(1,$Config.LauncherRelaunchDelay))
@@ -2037,7 +2152,6 @@ function Tap-ScreenCenter {
     $size = $sizes[$sizes.Count - 1]
     $x = [int][math]::Floor([int]$size.Groups[1].Value / 2)
     $y = [int][math]::Floor([int]$size.Groups[2].Value / 2)
-    Write-FlowStatus "Tapping screen center: $x, $y"
     Invoke-Android "shell input tap $x $y" | Out-Null
 }
 
@@ -2178,7 +2292,7 @@ function Restore-GameAppWindow {
         Start-Sleep -Seconds ([math]::Max(1,$Config.PollInterval))
         $presentation=Get-GameAppPresentation -Deadline $Deadline -Fresh;$lastState=$presentation.State
         if($lastState -eq 'Visible'){$samples++}else{$samples=0}
-        if($samples -ge 2){Write-FlowStatus 'Existing app window is visible. Checking Home/game state again.';return}
+        if($samples -ge 2){Write-FlowStatus 'Existing app window is visible. Checking game status.';return}
     }
     if($lastState -eq 'Unknown'){throw (New-GameStatusReadError 'App window visibility could not be read after restoring it. Retrying without assuming a game failure.')}
     Register-FlowStageTimeout -Stage Game
@@ -2497,7 +2611,7 @@ function Get-VisibleAppCrashPackages {
     catch [System.Management.Automation.PipelineStoppedException] { throw }
     catch [OperationCanceledException] { throw }
     catch {
-        if (-not $script:AppCrashProbeUnavailable) { Write-FlowStatus 'Android crash-window check is temporarily unavailable. Continuing with game logs.' }
+        if (-not $script:AppCrashProbeUnavailable) { Write-FlowStatus 'Android crash-window check is temporarily unavailable. Will retry on the next check.' }
         $script:AppCrashProbeUnavailable=$true
     }
     $script:AppCrashWindowCache=$packages
@@ -2615,7 +2729,7 @@ function Open-ServerLinkWithRetry {
     while ($true) {
         Enter-EmulatorLoadingSlot
         $attempt++
-        Write-FlowStatus "Sending the server link (attempt $attempt)..."
+        Write-FlowStatus "Sending server link (attempt $attempt)..."
         
         
         if ($null -ne $script:NextGameConnectionDialogProbe) {
@@ -2633,7 +2747,7 @@ function Open-ServerLinkWithRetry {
             $result = $_.Exception.Message
         }
         if (-not $commandTimedOut -and $result -match '(?im)^\s*Status:\s*ok\s*$' -and $result -notmatch '(?i)(Error:|Error type|Exception|unable to resolve)') {
-            Write-FlowStatus 'Server link opened.'
+            Write-FlowStatus 'Server link sent. Waiting for the game.'
             return 'LinkOpened'
         }
         if (-not $commandTimedOut -and $result -notmatch '(?im)^\s*Status:\s*timeout\s*$') {
@@ -2722,7 +2836,7 @@ function Ensure-CloudflareConnected {
     while ($true) {
         $attempt++
         $connectionTimedOut=$false
-        Write-FlowStatus "Checking Cloudflare VPN (attempt $attempt). The game app will wait until Connected."
+        Write-FlowStatus "Checking VPN (attempt $attempt)..."
         try {
             $connected=$false
             try { $connected=Test-CloudflareVpnConnected }
@@ -2731,25 +2845,25 @@ function Ensure-CloudflareConnected {
             catch { Write-FlowStatus ('Background VPN status is unavailable: '+$_.Exception.Message+'. Checking Cloudflare itself.') }
             if ($connected) {
                 Reset-FlowStageTimeout -Stage Cloudflare
-                Write-FlowStatus 'Cloudflare VPN is connected. Continuing to the game app.'
+                Write-FlowStatus 'VPN connected.'
                 return
             }
             if (Test-AppForeground -Package $CloudflarePackage) {
-                Write-FlowStatus 'Cloudflare is already on screen. Skipping its opening step.'
+
             }
             else {
-                Write-FlowStatus "Bringing Cloudflare to the screen (attempt $attempt)..."
+                Write-FlowStatus "Opening VPN app..."
                 Invoke-Ld -Arguments @('killapp', '--index', "$InstanceIndex", '--packagename', $CloudflarePackage) | Out-Null
                 Start-Sleep -Seconds $Config.CloudflareRetryDelay
                 Invoke-Ld -Arguments @('runapp', '--index', "$InstanceIndex", '--packagename', $CloudflarePackage) | Out-Null
             }
             $state = Wait-CloudflareState -States @('Disconnected', 'Connected') -Seconds $Config.CloudflareOpenTimeout
-            if ($state -ceq 'Connected') { Reset-FlowStageTimeout -Stage Cloudflare;Write-FlowStatus 'Cloudflare is Connected. Continuing to the game app.'; return }
+            if ($state -ceq 'Connected') { Reset-FlowStageTimeout -Stage Cloudflare;Write-FlowStatus 'VPN connected.'; return }
             if ($state -ceq 'Disconnected') {
                 Tap-ScreenCenter
-                Write-FlowStatus "Waiting up to $($Config.CloudflareConnectTimeout) seconds for Connected..."
+                Write-FlowStatus "Waiting for VPN connection (up to $($Config.CloudflareConnectTimeout)s)..."
                 $state = Wait-CloudflareState -States @('Connected') -Seconds $Config.CloudflareConnectTimeout
-                if ($state -ceq 'Connected') { Reset-FlowStageTimeout -Stage Cloudflare;Write-FlowStatus 'Cloudflare is Connected. Continuing to the game app.'; return }
+                if ($state -ceq 'Connected') { Reset-FlowStageTimeout -Stage Cloudflare;Write-FlowStatus 'VPN connected.'; return }
             }
             $connectionTimedOut=$true
         }
@@ -2760,7 +2874,7 @@ function Ensure-CloudflareConnected {
 
         
         try {
-            if (Test-CloudflareVpnConnected) { Reset-FlowStageTimeout -Stage Cloudflare;Write-FlowStatus 'Cloudflare VPN is connected. Continuing to the game app.'; return }
+            if (Test-CloudflareVpnConnected) { Reset-FlowStageTimeout -Stage Cloudflare;Write-FlowStatus 'VPN connected.'; return }
         }
         catch [System.Management.Automation.PipelineStoppedException] { throw }
         catch [OperationCanceledException] { throw }
@@ -2915,7 +3029,7 @@ function Move-GameAppDataIdentity {
         $account=ConvertFrom-Json ([IO.File]::ReadAllText($accountPath));$account.emulatorId=[int]$Journal.NewId;Write-TemplateStageManifest $accountPath $account
     }
     $null=Get-DiskBackupEntry $Settings $Journal.NewId
-    Write-FlowStatus "Backup identity $($Journal.OldId) -> $($Journal.NewId) verified. Replacement disks already contain both apps' account data."
+    Write-FlowStatus "Backup moved: $($Journal.OldId) -> $($Journal.NewId)."
 }
 
 
@@ -3070,7 +3184,7 @@ function Set-InstanceReplacementStep {
     $Journal|Add-Member NoteProperty Step $Step -Force
     $Journal|Add-Member NoteProperty LastError $null -Force
     Write-TemplateStageManifest $JournalPath $Journal
-    Write-FlowStatus "Replacement $($Journal.OldId) -> $($Journal.NewId): $Step."
+    Write-FlowStatus "Replacement $($Journal.OldId) -> $($Journal.NewId): $Step." -Key ('ReplacementStep|'+$Journal.Token) -Emulator
 }
 
 function Write-ReplacementTextFile {
@@ -3510,7 +3624,6 @@ function Remove-ReplacedInstanceNative {
         if(Test-FlowStopRequested){throw 'Stop requested before native instance deletion. The same replacement remains pending.'}
         $Journal|Add-Member NoteProperty SourceCleanupStarted $true -Force
         Write-TemplateStageManifest $JournalPath $Journal
-        Write-FlowStatus "Replacement $oldId -> $($Journal.NewId): deleting only old LDPlayer $oldId using LDPlayer's built-in delete command..."
         $nativeFailure=$null
         try{$null=Invoke-Ld -Arguments @('remove','--index',"$oldId") -TimeoutSeconds ([math]::Max(10,[int]$Settings.CommandTimeout))}
         catch{$nativeFailure=$_.Exception.Message}
@@ -3531,7 +3644,7 @@ function Remove-ReplacedInstanceNative {
             if(Test-FlowStopRequested){throw 'Stop requested while waiting for native deletion. The same replacement remains pending.'}
             Start-Sleep -Milliseconds 1000
         }while($true)
-        Write-FlowStatus "LDPlayer deleted old instance $oldId. Its registration and old emulator files are gone."
+        Write-FlowStatus "Old instance $oldId deleted."
     }
     $Journal|Add-Member NoteProperty SourceDeleted $true -Force
     $Journal|Add-Member NoteProperty OldDataDeleted $true -Force
@@ -3675,16 +3788,16 @@ function Complete-InstanceReplacementMetadata {
     $newKey=[string]$Journal.NewId
     if($history.ContainsKey($newKey) -and $history[$newKey] -ne $Journal.OldId){throw 'Replacement ID history conflicts with a different old instance.'}
     $Journal|Add-Member NoteProperty Version 2 -Force
-    Set-InstanceReplacementStep $Journal $JournalPath 'Verifying installed files'
+    Set-InstanceReplacementStep $Journal $JournalPath 'Verifying replacement'
     Assert-InstalledInstanceReplacement $Settings $Journal -AllowRunning
-    Set-InstanceReplacementStep $Journal $JournalPath 'Verifying and renaming the saved emulator backup'
+    Set-InstanceReplacementStep $Journal $JournalPath 'Moving backup to the new ID'
     Move-GameAppDataIdentity $Settings $Journal
     $history[$newKey]=[int]$Journal.OldId
     Write-TemplateStageManifest $paths.History @{Version=1;Origins=$history}
     $values=Read-LauncherUiConfig $Settings.ConfigFilePath
     $excluded=@($values.ExcludedLdPlayerIds -split ','|Where-Object{$_ -match '^\d+$'}|ForEach-Object{[int]$_})
     $excluded=@(@($excluded)+@([int]$Journal.OldId)|Where-Object{$_ -ne $Journal.NewId}|Sort-Object -Unique)
-    Set-InstanceReplacementStep $Journal $JournalPath 'Removing verified old emulator files'
+    Set-InstanceReplacementStep $Journal $JournalPath 'Removing old emulator'
     
     if($Journal.DataSource -eq 'Template0'){Complete-TemplateDataReplacementCleanup $Settings $Journal $JournalPath}
     if($Journal.TransferMode -eq 'CopyDelete'){Complete-CopiedInstanceSourceCleanup $Settings $Journal $JournalPath}
@@ -3692,12 +3805,12 @@ function Complete-InstanceReplacementMetadata {
         Remove-ReplacedInstanceNative $Settings $Journal $JournalPath
     }
     $Journal|Add-Member NoteProperty DeferredSourceCleanup $null -Force
-    Set-InstanceReplacementStep $Journal $JournalPath 'Saving and verifying excluded IDs'
+    Set-InstanceReplacementStep $Journal $JournalPath 'Updating excluded IDs'
     Set-LauncherConfigValues -Path $Settings.ConfigFilePath -Values @{ExcludedLdPlayerIds=($excluded -join ',')} -Automatic
     $saved=Read-LauncherUiConfig $Settings.ConfigFilePath
     $savedExcluded=@($saved.ExcludedLdPlayerIds -split ','|Where-Object{$_ -match '^\d+$'}|ForEach-Object{[int]$_})
     if($savedExcluded -notcontains [int]$Journal.OldId -or $savedExcluded -contains [int]$Journal.NewId){throw 'Replacement exclusions are not saved yet. Metadata will retry.'}
-    $Journal.Phase='Ready';$Journal|Add-Member NoteProperty Step 'Waiting for worker handoff' -Force
+    $Journal.Phase='Ready';$Journal|Add-Member NoteProperty Step 'Transferring worker to the new ID' -Force
     Write-TemplateStageManifest $JournalPath $Journal
 }
 
@@ -3781,7 +3894,7 @@ function Wait-InstanceReplacementSourcesClosed {
     if(-not $running -and $owned.Count -eq 0){return}
     if(Test-FlowStopRequested){throw [OperationCanceledException]::new('Stopped before closing the replacement source.')}
     if($Journal -and $JournalPath){$Journal|Add-Member NoteProperty SourceHostProcesses $owned -Force;Write-TemplateStageManifest $JournalPath $Journal}
-    Write-FlowStatus "Closing LDPlayer $OldId apps before closing the old replacement source..."
+    Write-FlowStatus "Closing old emulator and its apps..."
     if($running){
         try{Close-AppsBeforeEmulatorRestart}
         catch [System.Management.Automation.PipelineStoppedException]{throw}
@@ -3810,7 +3923,7 @@ function Wait-InstanceReplacementSourcesClosed {
         if([datetime]::UtcNow -ge $deadline){throw "Old LDPlayer $OldId processes have not fully exited. No files were copied or deleted; this replacement will retry. $quitError"}
         Start-Sleep -Milliseconds 1000
     }
-    Write-FlowStatus "Old LDPlayer $OldId is closed and its instance processes have exited. Continuing the same replacement."
+    Write-FlowStatus "Old emulator closed; its processes have exited."
 }
 
 function Invoke-InstanceReplacement {
@@ -3832,7 +3945,7 @@ function Invoke-InstanceReplacement {
         Enter-EmulatorRestoreSlot
         Set-EmulatorLiveObservation -EmulatorState Replacing
         $script:RestoreQueueRecord.Phase='Restoring';Write-RestoreQueueRecord $script:RestoreQueuePath $script:RestoreQueueRecord
-        Write-FlowStatus 'Checking the reserved replacement ID and saved progress...'
+
         while(-not $held){
             if(Test-FlowStopRequested){throw [OperationCanceledException]::new('Stopped while waiting for instance replacement.')}
             try{$held=$mutex.WaitOne(1000)}catch [Threading.AbandonedMutexException]{$held=$true}
@@ -3889,11 +4002,11 @@ function Invoke-InstanceReplacement {
             Write-FlowStatus "Creating LDPlayer $($journal.NewId): copying and verifying the replacement files before deleting closed instance $oldId. Data source: $($journal.DataSource)."
         }
         if($journal.Phase -in @('Preparing','Moving','Copying')){
-            Set-InstanceReplacementStep $journal $journalPath 'Copying missing replacement files'
+            Set-InstanceReplacementStep $journal $journalPath 'Copying replacement files'
             Prepare-InstanceReplacementFiles $Config $journal $journalPath
         }
         if($journal.Phase -in @('Prepared','Installing')){
-            Set-InstanceReplacementStep $journal $journalPath 'Publishing replacement disks and registration'
+            Set-InstanceReplacementStep $journal $journalPath 'Installing replacement files'
             if($journal.TransferMode -in @('Move','CopyDelete')){Assert-MovedInstanceSourceClosed $Config $oldId}
             elseif((Get-RestoreTargetInfo -Id $oldId).Running){throw 'The source restarted during preparation. Installation was postponed.'}
             Install-InstanceReplacementFiles $Config $journal $journalPath
@@ -3904,7 +4017,7 @@ function Invoke-InstanceReplacement {
                 try{$held=$mutex.WaitOne(1000)}catch [Threading.AbandonedMutexException]{$held=$true}
             }
             $target=Get-RestoreTargetInfo -Id $journal.NewId
-            Set-InstanceReplacementStep $journal $journalPath 'Finalizing the existing replacement'
+            Set-InstanceReplacementStep $journal $journalPath 'Verifying replacement'
             if($target.Name -cne "LDPlayer-$($journal.NewId)"){throw 'The replacement name does not match the journal.'}
             try{Assert-InstalledInstanceReplacement $Config $journal -AllowRunning}
             catch{
@@ -3927,7 +4040,7 @@ function Invoke-InstanceReplacement {
             foreach($item in @(Get-ChildItem -LiteralPath $journal.Stage -Force -Recurse)){Assert-InstanceReplacementDirectory $item.FullName (Join-Path $Config.LdPlayerInstallPath 'vms')}
             [IO.Directory]::Delete($journal.Stage,$true)
         }
-        Set-InstanceReplacementStep $journal $journalPath 'Waiting for worker handoff'
+        Set-InstanceReplacementStep $journal $journalPath 'Transferring worker to the new ID'
         $event=@{OldId=$oldId;NewId=[int]$journal.NewId;Token=$journal.Token}
         Write-TemplateStageManifest (Join-Path $Config.ReplacementHandoffDirectory "handoff-$oldId.json") $event
     }catch{
@@ -3944,7 +4057,7 @@ function Invoke-InstanceReplacement {
         if($held){$mutex.ReleaseMutex()};$mutex.Dispose()
         if($instanceHeld){$instanceMutex.ReleaseMutex()};$instanceMutex.Dispose()
     }
-    Write-FlowStatus "Replacement $($journal.NewId) is ready. Waiting for its current-run worker/loading-slot handoff..."
+    Write-FlowStatus "Replacement $($journal.NewId) is ready. Transferring its worker..."
     $ackPath=Join-Path $Config.ReplacementHandoffDirectory "ack-$oldId.json"
     while($true){
         if(Test-FlowStopRequested){throw [OperationCanceledException]::new('Stopped after replacement registration.')}
@@ -4000,7 +4113,7 @@ function Invoke-WorkerWithInstanceReplacement {
             ;;$script:LoadedAppDataCaptures=@{};;;;
             $script:VpnVerifiedBoot=0;$script:CloudflareUidCache=$null;$script:EmulatorUptimeProcessId=0;$script:StartupFailureCount=0;$script:GameLinkSentAt=@{}
             Clear-ProcessCheckCache
-            Write-FlowStatus "This worker now handles replacement $InstanceIndex. Continuing Roblox endpoint, local readiness-marker and root-off startup."
+            Write-FlowStatus "Worker assigned to instance $InstanceIndex. Starting normal setup." -Emulator
         }catch{
             if($script:PoolRole){
                 $package=[string]$_.Exception.Data['GamePackage'];if(-not $package){$package=$script:PoolActivePackage}
@@ -4338,7 +4451,7 @@ function Resolve-LauncherRestoreBackup {
 function Set-EmulatorRestoreRequired {
     param([string]$Reason)
     $script:PendingEmulatorRestore=$Reason
-    $failure=[InvalidOperationException]::new($Reason+' The affected emulator will be closed and recovered using the configured source.')
+    $failure=[InvalidOperationException]::new($Reason+' Instance replacement is required.')
     $failure.Data['RestoreRequired']=$true
     throw $failure
 }
@@ -4466,7 +4579,7 @@ function Register-PackageCheckFailure {
     $script:PackageCheckFailureCount=0
     $script:RequiredAppsCheckedKey=$null
     $script:PackageCheckRestartPending=$false;$script:PendingInstanceReplacement=$true
-    Write-FlowStatus 'Package checks reached their limit. Creating a new instance from the affected emulator disks, VM registration and config.'
+    Write-FlowStatus 'Package checks reached their limit. Queuing instance replacement.'
     throw (New-PackageCheckRestartError)
 }
 
@@ -4479,7 +4592,7 @@ function Confirm-RequiredEmulatorApps {
     $key="$BootIdentity|$($required -join ',')"
     if($script:RequiredAppsCheckedKey -ceq $key){return}
     if(Test-FlowStopRequested){throw [OperationCanceledException]::new('Stopped during package verification.')}
-    Write-FlowStatus "Checking required packages once: $($required -join ', ')"
+    Write-FlowStatus "Checking required apps..."
     $paths=$null
     try{$paths=Get-RequiredPackagePaths -Packages $required -Deadline ([datetime]::UtcNow.AddSeconds($Config.CommandTimeout))}
     catch [System.Management.Automation.PipelineStoppedException]{throw}
@@ -4489,7 +4602,7 @@ function Confirm-RequiredEmulatorApps {
     if($null -eq $paths){Request-NoRootReplacement 'The single package check could not confirm the installed packages. No specific package was assumed missing.'}
     if($paths.Missing.Count){Request-NoRootReplacement ('Required packages are missing: '+($paths.Missing -join ', '))}
     Reset-PackageCheckRecovery;$script:RequiredAppsCheckedKey=$key
-    Write-FlowStatus 'All required packages are installed.'
+    Write-FlowStatus 'Required apps installed.'
 }
 
 function Invoke-PackageCheckRecovery {
@@ -4596,7 +4709,7 @@ function Enter-EmulatorRestoreSlot {
                     $eligible=@($waiting|Select-Object -First $free)
                     if(@($eligible|Where-Object{$_.StatePath -ceq $path}).Count -gt 0){
                         $record.Phase='Granted';Write-RestoreQueueRecord -Path $path -Record $record
-                        Write-FlowStatus "Received an instance replacement slot ($($active.Count+1)/$limit)."
+                        Write-FlowStatus "Replacement slot granted ($($active.Count+1)/$limit)." -Key ReplacementSlot -Emulator
                         return
                     }
                 }
@@ -4650,7 +4763,7 @@ function Invoke-LdPlayerRestoreCommand {
 function Invoke-PendingEmulatorRestore {
     if(-not $script:PendingEmulatorRestore){return}
     Assert-PoolSetupTurn
-    Write-FlowStatus ('Recovery queued with template 0 data and a new emulator ID: '+$script:PendingEmulatorRestore)
+    Write-FlowStatus ('Replacement queued: '+(Format-LauncherLogReason $script:PendingEmulatorRestore)+'.') -Key ReplacementReason -Emulator
     $script:PendingInstanceReplacement=$true
     Invoke-InstanceReplacement -FreshData
 }
@@ -4892,8 +5005,9 @@ function Invoke-ResilientEmulatorFlow {
                 $waitingForJoin=$script:PoolRole -eq 'Setup' -and $null -ne $app.LinkSentUtc
                 $state=Get-LauncherSessionState -RequireReady:$waitingForJoin
                 if($state -cne $app.LastState){
-                    $checks=if($waitingForJoin){'Roblox endpoint + join marker/ADB'}else{'Roblox endpoint + Android/app state'}
-                    Write-FlowStatus "Game status: $state ($checks).";$app.LastState=$state
+                    $label=switch($state){'InGame'{'In game'};'Minimized'{'Hidden'};'NotResponding'{'Not responding'};default{$state}}
+                    if($state -notin @('Unknown','Minimized','Closed')){Write-FlowStatus "Status: $label." -Key Status}
+                    $app.LastState=$state
                 }
                 if($state -in @('Unknown','Minimized','Closed')){
                     $app.Ready=$false
@@ -4903,20 +5017,20 @@ function Invoke-ResilientEmulatorFlow {
                     $label=if($state -eq 'Minimized'){'Hidden'}else{$state}
                     if($script:PoolRole -eq 'Monitor'){
                         $app.RecoveryCheckUtc=$null
-                        Write-FlowStatus ("App marked $label. Queued for a setup worker to recheck for $timeout seconds."+$reason)
+                        Write-FlowStatus ("$label. Queued for a setup check (${timeout}s)."+$reason) -Key Status
                         Assert-PoolSetupTurn
                     }
                     if($state -eq 'Unknown' -or -not $app.OpenRequestUtc){
                         if(-not $app.RecoveryCheckUtc){
                             $app.RecoveryCheckUtc=[datetime]::UtcNow
-                            Write-FlowStatus ("App is $label. Rechecking for up to $timeout seconds before closing it and running normal recovery."+$reason)
+                            Write-FlowStatus ("$label. Checking again for ${timeout}s before recovery."+$reason) -Key Status
                         }
                         $elapsed=([datetime]::UtcNow-$app.RecoveryCheckUtc).TotalSeconds
                         if($elapsed -lt $timeout){
                             Wait-FlowPause ([int][math]::Min([math]::Max(1,$Config.PollInterval),[math]::Max(1,[math]::Ceiling($timeout-$elapsed))))
                             continue
                         }
-                        Reset-HybridAppForRecovery $package $app "App stayed unknown, hidden or closed for $timeout seconds in its setup turn."
+                        Reset-HybridAppForRecovery $package $app "No usable app state for ${timeout}s."
                         $state='Closed'
                     }
                 }else{
@@ -4980,7 +5094,7 @@ function Invoke-ResilientEmulatorFlow {
         }
         if($script:PoolRole -ne 'Monitor'){
             Set-BootRequestPhase Finished
-            Write-FlowStatus 'All game apps are in game. Server-link joins were checked for the local marker. Released the emulator setup slot.'
+            Write-FlowStatus 'Both apps are in game. Setup slot released.'
         }
         return 'Monitoring'
     }finally{$script:HybridCapture=$null;$Config=$base}
@@ -5480,7 +5594,7 @@ function Sync-EmulatorPoolCapacity {
     for($number=1;$number -le $Capacity;$number++){
         if(@($Workers|Where-Object{$_.Role -eq 'Setup' -and $_.Number -eq $number}).Count){continue}
         $Workers.Add((New-EmulatorPoolRunspace $Definitions 'Setup' $number))
-        Write-Host "Setup worker $number started for the current loading limit."
+        Write-Host "Setup worker $number started."
     }
 }
 
@@ -5631,7 +5745,7 @@ function Invoke-FixedEmulatorWorkerPool {
     try{
         $workers.Add((New-EmulatorPoolRunspace $FunctionDefinitions 'Monitor' 0))
         Sync-EmulatorPoolCapacity $workers $desiredCapacity $FunctionDefinitions
-        Write-Host "Started 1 monitor for $($records.Count) emulators. Setup workers follow the current loading limit."
+        Write-Host "Monitoring $($records.Count) emulators. Setup workers follow the loading limit."
         while($true){
             foreach($worker in $workers){Write-EmulatorPoolTurnMessages $worker;$null=Complete-EmulatorPoolTurn $worker $Settings}
             foreach($record in @($records|Where-Object{$_.Status -eq 'Retired' -and -not $_.BusyRole})){
@@ -5819,20 +5933,10 @@ function Add-LauncherUiLog {
     param([string]$Text)
     if(-not $Text){return}
     if($Ui.LogArchiveWriter){
-        try{$Ui.LogArchiveWriter.Write($Text);$Ui.LogArchiveWriter.Flush()}
-        catch{$Ui.LogArchiveError=$true}
+        try{$Ui.LogArchiveWriter.Write($Text);$Ui.LogArchiveWriter.Flush()}catch{$Ui.LogArchiveError=$true}
     }
-    $Ui.Log.AppendText($Text)
-    if($Ui.Log.TextLength -gt 200000){
-        $current=$Ui.Log.Text
-        $start=[math]::Max(0,$current.Length-100000)
-        $line=$current.IndexOf("`n",$start)
-        if($line -ge 0 -and $line+1 -lt $current.Length){$start=$line+1}
-        
-        
-        $Ui.Log.Text=$current.Substring($start)
-    }
-    $Ui.Log.SelectionStart=$Ui.Log.TextLength; $Ui.Log.ScrollToCaret()
+    Initialize-LauncherLogUiNative
+    [LauncherLogView]::Append($Ui.Log,$Text)
 }
 
 function Copy-LauncherUiText {
@@ -6182,56 +6286,7 @@ function Complete-LauncherUiWindowArrangement {
 
 
 
-function Initialize-LauncherOutputReader {
-    if('LauncherOutputReader' -as [type]){return}
-    $definition=@'
-using System;
-using System.Collections.Concurrent;
-using System.Diagnostics;
-using System.IO;
-using System.Text;
-public sealed class LauncherOutputReader : IDisposable {
-    private readonly ConcurrentQueue<string> lines = new ConcurrentQueue<string>();
-    private readonly object gate = new object();
-    private readonly Process process;
-    private StreamWriter writer;
-    private bool disposed;
-    public LauncherOutputReader(Process process, string logFile) {
-        this.process = process;
-        writer = new StreamWriter(new FileStream(logFile, FileMode.Append, FileAccess.Write, FileShare.ReadWrite), new UTF8Encoding(false));
-        writer.AutoFlush = true;
-        process.OutputDataReceived += Receive;
-        process.ErrorDataReceived += Receive;
-    }
-    private void Receive(object sender, DataReceivedEventArgs e) {
-        if(e.Data == null) return;
-        var line = e.Data + Environment.NewLine;
-        lock(gate) {
-            if(disposed) return;
-            lines.Enqueue(line);
-            try { writer.Write(line); } catch(IOException) { }
-        }
-    }
-    public void Start() { process.BeginOutputReadLine(); process.BeginErrorReadLine(); }
-    public string Drain() {
-        var text = new StringBuilder(); string line;
-        while(text.Length < 262144 && lines.TryDequeue(out line)) text.Append(line);
-        return text.ToString();
-    }
-    public void Dispose() {
-        lock(gate) {
-            if(disposed) return;
-            disposed = true;
-            process.OutputDataReceived -= Receive;
-            process.ErrorDataReceived -= Receive;
-            writer.Dispose();
-        }
-    }
-}
-'@
-    if($PSVersionTable.PSVersion.Major -ge 6){Add-Type -TypeDefinition $definition}
-    else{Add-Type -TypeDefinition $definition -ReferencedAssemblies 'System.dll','System.Core.dll'}
-}
+function Initialize-LauncherOutputReader {Initialize-LauncherLogUiNative}
 
 function Clear-LauncherRunState {
     param([string]$Directory)
