@@ -141,58 +141,6 @@ function Format-LauncherLogReason {
     }
     return $message
 }
-function Reset-HybridAppForRecovery {
-    param([string]$Package,$App,[string]$Reason)
-    $App.Ready=$false;$App.LinkSentUtc=$null;$App.JoiningUtc=$null;$App.Opened=$false;$App.OpenedUtc=$null;$App.OpenRequestUtc=$null;$App.NegativeCount=0;$App.LastNegativeTicks=0L;$App.RecoveryCheckUtc=$null
-    $script:AppWindowSnapshotTicks=0;$script:HybridCapture=$null
-    $script:PoolActivePackage=$Package;$script:RecoveryScope='Game'
-    if($script:PoolRole -eq 'Monitor'){
-        $null=Request-MonitorQuickRecovery -Package $Package
-        Assert-PoolSetupTurn
-    }
-    if(-not (Test-EmulatorResponsive)) {
-        Close-NoRootManagedInstance
-        $failure=[OperationCanceledException]::new('Android is not responding. The emulator is closed and queued for a fresh setup turn.')
-        $failure.Data['PoolNeedsSetup']=$true;throw $failure
-    }
-    Invoke-Ld -Arguments @('killapp','--index',"$InstanceIndex",'--packagename',$Package)|Out-Null
-    Write-FlowStatus ($Reason+' App closed; reopening through setup.') -Key Recovery
-}
-function Get-HybridMarkerBounds {
-    param([string]$Windows,[string]$Package)
-    $owner='\bpackage='+[regex]::Escape($Package)+'(?:\s|$)'
-    $blocks=[regex]::Matches($Windows,'(?ms)^\s*Window #\d+\s+Window\{[^\r\n]*\}:(?<body>.*?)(?=^\s*Window #\d+\s+Window\{|^\s*mGlobalConfiguration=|\z)')
-    $selected=$null;$best=-1
-    foreach($block in $blocks){
-        $body=$block.Groups['body'].Value
-        if($body -cnotmatch $owner -or $body -match '\bty=(?:APPLICATION_OVERLAY|SYSTEM_ALERT)\b' -or $body -notmatch '\bmHasSurface=true\b' -or $body -notmatch '(?m)^\s*isVisible=true\s*$'){continue}
-        $frame=[regex]::Match($body,'\bmFrame=\[(-?\d+),(-?\d+)\]\[(-?\d+),(-?\d+)\]')
-        if(-not $frame.Success){continue}
-        $x=[int]$frame.Groups[1].Value;$y=[int]$frame.Groups[2].Value
-        $width=[int]$frame.Groups[3].Value-$x;$height=[int]$frame.Groups[4].Value-$y
-        if($width -lt 32 -or $height -lt 32){continue}
-        $native=$block.Value -match ('(?m)^\s*Window #\d+\s+Window\{[^\r\n]*'+[regex]::Escape($Package)+'/com[.]roblox[.]client[.]ActivityNativeMain(?:\s|\})')
-        $rank=if($native){2}else{1}
-        if($rank -gt $best){$selected=@($x,$y,$width,$height);$best=$rank}
-    }
-    return $selected
-}
-function Get-HybridPresence {
-    param([string]$Package=$Config.GamePackage)
-    Initialize-HybridStatusNative
-    $accounts=Get-HybridSavedAccounts;$key="$InstanceIndex|$Package"
-    if(-not $accounts.ContainsKey($key)){return @{Available=$false;Type=-1;SampleTicks=0L;Error='Saved user ID is missing for this app.'}}
-    $ids=[long[]]@($accounts.Values|Sort-Object -Unique)
-    return [LauncherPcPresence]::Get([long]$accounts[$key],$ids,[math]::Max(3,$Config.GameCheckInterval),[string]$Config.StopFilePath)
-}
-function Get-HybridAppState {
-    param($Instance)
-    if($script:HybridBoot -ne $Instance.ProcessId -or -not $script:HybridApps){
-        $script:HybridBoot=$Instance.ProcessId;$script:HybridApps=@{};$script:HybridPresenceSamples=@{}
-        foreach($package in $Config.GamePackages){$script:HybridApps[$package]=@{Ready=$false;LinkSentUtc=$null;JoiningUtc=$null;LastState='';LastNegativeTicks=0L;NegativeCount=0;Opened=$false;OpenedUtc=$null;OpenRequestUtc=$null;RecoveryCheckUtc=$null}}
-    }
-    return $script:HybridApps
-}
 function Get-HybridSavedAccounts {
     $root=Get-DiskBackupRoot $Config
     $selection=(@($Config.LdPlayerIds|Sort-Object -Unique) -join ',')+'|'+($Config.GamePackages -join ',')
@@ -211,22 +159,6 @@ function Get-HybridSavedAccounts {
     }
     $script:HybridAccountsKey=$key;$script:HybridAccounts=$accounts;$script:HybridAccountsSelection=$selection;$script:HybridAccountsCheckedUtc=[datetime]::UtcNow
     return $accounts
-}
-function Get-HybridWindowSnapshot {
-    param([datetime]$Deadline=[datetime]::UtcNow.AddSeconds($Config.CommandTimeout),[switch]$Fresh)
-    $ttl=[math]::Max(1,[math]::Min(3,$Config.PollInterval))
-    if(-not $Fresh -and $script:AppWindowSnapshotInstance -eq $InstanceIndex -and $script:AppWindowSnapshotTicks -gt 0){
-        $age=([Diagnostics.Stopwatch]::GetTimestamp()-$script:AppWindowSnapshotTicks)/[double][Diagnostics.Stopwatch]::Frequency
-        if($age -lt $ttl -and $script:AppWindowSnapshot -match 'LAUNCHER_PID:'){return $script:AppWindowSnapshot}
-    }
-    $command='shell for p in '+($Config.GamePackages -join ' ')+'; do echo LAUNCHER_PID:$p:$(pidof $p); done; dumpsys -t 5 window windows'
-    $remaining=[math]::Ceiling(($Deadline-[datetime]::UtcNow).TotalSeconds)
-    if($remaining -le 0){throw (New-GameStatusReadError 'The app-window check reached its deadline.')}
-    $windows=Invoke-Android $command -TimeoutSeconds ([math]::Min(6,$remaining))
-    $windows=$windows -replace '\r+\n',"`n"
-    if($windows -notmatch 'WINDOW MANAGER WINDOWS|mCurrentFocus=' -or $windows -match 'DUMP TIMEOUT'){throw (New-GameStatusReadError 'Android app-window state is unavailable.')}
-    $script:AppWindowSnapshot=$windows;$script:AppWindowSnapshotInstance=$InstanceIndex;$script:AppWindowSnapshotTicks=[Diagnostics.Stopwatch]::GetTimestamp()
-    return $windows
 }
 function Initialize-HybridStatusNative {
     if('LauncherPcPresence' -as [type]){return}
@@ -249,6 +181,12 @@ public sealed class LauncherPresenceResult {
     public long SampleTicks;
     public string Error="";
 }
+public sealed class LauncherEndpointStatus {
+    public string State="Waiting",Error="",RateLimit="",RateRemaining="";
+    public bool InFlight;
+    public int HttpStatus,RequestedCount,ReturnedCount;
+    public long RequestCount,LastAttemptTicks,LastSuccessTicks,LastCompletedTicks,NextRequestTicks,FreshUntilTicks;
+}
 public static class LauncherPcPresence {
     static readonly object gate=new object();
     static readonly Dictionary<long,LauncherPresenceResult> results=new Dictionary<long,LauncherPresenceResult>();
@@ -257,6 +195,12 @@ public static class LauncherPcPresence {
     static DateTime next=DateTime.MinValue;
     static string failure="Waiting for a Roblox endpoint response.";
     static int failures;
+    static string endpointState="Waiting",endpointError="",rateLimit="",rateRemaining="";
+    static int httpStatus,requestedCount,returnedCount;
+    static long requestCount,lastAttemptTicks,lastSuccessTicks,lastCompletedTicks,freshUntilTicks;
+    public static LauncherEndpointStatus Snapshot(){
+        lock(gate){return new LauncherEndpointStatus{State=endpointState,Error=endpointError,RateLimit=rateLimit,RateRemaining=rateRemaining,InFlight=busy,HttpStatus=httpStatus,RequestedCount=requestedCount,ReturnedCount=returnedCount,RequestCount=requestCount,LastAttemptTicks=lastAttemptTicks,LastSuccessTicks=lastSuccessTicks,LastCompletedTicks=lastCompletedTicks,NextRequestTicks=next.Ticks,FreshUntilTicks=freshUntilTicks};}
+    }
     public static LauncherPresenceResult Get(long id,long[] ids,int interval,string stop){
         lock(gate){
             requested.Clear();
@@ -277,9 +221,11 @@ public static class LauncherPcPresence {
     }
     static void Fetch(List<long> ids,int interval,string stop){
         int delay=Math.Max(interval,((ids.Count+49)/50)*2);string error="";
+        int received=0;bool cancelled=false;
+        lock(gate){requestedCount=ids.Count;returnedCount=0;}
         try{
             for(int start=0;start<ids.Count;start+=50){
-                if(File.Exists(stop))return;
+                if(File.Exists(stop)){cancelled=true;return;}
                 var batch=ids.GetRange(start,Math.Min(50,ids.Count-start));
                 string body="{\"userIds\":["+String.Join(",",batch.ToArray())+"]}";
                 var request=(HttpWebRequest)WebRequest.Create("https://presence.roblox.com/v1/presence/users");
@@ -293,6 +239,7 @@ public static class LauncherPcPresence {
                 request.AllowAutoRedirect=false;request.CookieContainer=null;
                 ServicePointManager.SecurityProtocol|=SecurityProtocolType.Tls12;
                 byte[] data=Encoding.UTF8.GetBytes(body);request.ContentLength=data.Length;
+                lock(gate){requestCount++;lastAttemptTicks=DateTime.UtcNow.Ticks;httpStatus=0;}
                 try{
                     using(Stream stream=request.GetRequestStream()){stream.Write(data,0,data.Length);}
                     IAsyncResult pending=request.BeginGetResponse(null,null);
@@ -303,6 +250,7 @@ public static class LauncherPcPresence {
                         }
                     }
                     using(var response=(HttpWebResponse)request.EndGetResponse(pending)){
+                        lock(gate){httpStatus=(int)response.StatusCode;rateLimit=response.Headers["x-ratelimit-limit"]??"";rateRemaining=response.Headers["x-ratelimit-remaining"]??"";}
                         if((int)response.StatusCode!=200)throw new IOException("Roblox endpoint response was not successful.");
                         string json;
                         using(var reader=new StreamReader(response.GetResponseStream(),Encoding.UTF8)){
@@ -315,20 +263,23 @@ public static class LauncherPcPresence {
                         if(root==null||!root.TryGetValue("userPresences",out entries))throw new IOException("Roblox endpoint response was incomplete.");
                         var rows=entries as object[];if(rows==null)throw new IOException("Roblox endpoint response was incomplete.");
                         long ticks=DateTime.UtcNow.Ticks;
+                        var seen=new HashSet<long>();
                         lock(gate){
                             foreach(long user in batch)results.Remove(user);
                             foreach(object item in rows){
                                 var row=item as Dictionary<string,object>;object user,kind;
                                 if(row==null||!row.TryGetValue("userId",out user)||!row.TryGetValue("userPresenceType",out kind))continue;
                                 long number=Convert.ToInt64(user);int type=Convert.ToInt32(kind);
-                                if(batch.Contains(number)&&type>=0&&type<=3)results[number]=new LauncherPresenceResult{Available=true,Type=type,SampleTicks=ticks};
+                                if(batch.Contains(number)&&type>=0&&type<=3){results[number]=new LauncherPresenceResult{Available=true,Type=type,SampleTicks=ticks};seen.Add(number);}
                             }
+                            received+=seen.Count;returnedCount=received;
                         }
                     }
                 }catch(WebException ex){
                     var response=ex.Response as HttpWebResponse;
                     if(response!=null){using(response){
                         int status=(int)response.StatusCode,retry;
+                        lock(gate){httpStatus=status;rateLimit=response.Headers["x-ratelimit-limit"]??"";rateRemaining=response.Headers["x-ratelimit-remaining"]??"";}
                         if(status==429){delay=60;if(Int32.TryParse(response.Headers["Retry-After"],out retry))delay=Math.Max(delay,Math.Min(3600,retry));}
                         error="Roblox endpoint HTTP "+status+". Will retry.";
                     }}else error="Roblox endpoint connection failed. Will retry.";
@@ -340,6 +291,11 @@ public static class LauncherPcPresence {
             lock(gate){
                 if(error.Length>0){failures++;results.Clear();delay=Math.Max(delay,Math.Min(60,3*(1<<Math.Min(failures,4))));failure=error;}
                 else{failures=0;failure="Waiting for a Roblox endpoint response.";}
+                lastCompletedTicks=DateTime.UtcNow.Ticks;
+                if(cancelled){endpointState="Stopped";endpointError="";}
+                else if(error.Length>0){endpointState="Error";endpointError=error;}
+                else if(ids.Count>0&&received==ids.Count){endpointState="Success";endpointError="";lastSuccessTicks=lastCompletedTicks;freshUntilTicks=DateTime.UtcNow.AddSeconds(Math.Max(10,delay*2)).Ticks;}
+                else{endpointState="Incomplete";endpointError="Some account statuses were missing from the response.";}
                 next=DateTime.UtcNow.AddSeconds(delay);busy=false;
             }
         }
@@ -400,6 +356,78 @@ public static class LauncherMarkerPixels {
 '@}}
     finally{[Threading.Monitor]::Exit($gate)}
 }
+function Get-HybridPresence {
+    param([string]$Package=$Config.GamePackage)
+    Initialize-HybridStatusNative
+    $accounts=Get-HybridSavedAccounts;$key="$InstanceIndex|$Package"
+    if(-not $accounts.ContainsKey($key)){return @{Available=$false;Type=-1;SampleTicks=0L;Error='Saved user ID is missing for this app.'}}
+    $ids=[long[]]@($accounts.Values|Sort-Object -Unique)
+    return [LauncherPcPresence]::Get([long]$accounts[$key],$ids,[math]::Max(3,$Config.GameCheckInterval),[string]$Config.StopFilePath)
+}
+function Reset-HybridAppForRecovery {
+    param([string]$Package,$App,[string]$Reason)
+    $App.Ready=$false;$App.LinkSentUtc=$null;$App.JoiningUtc=$null;$App.Opened=$false;$App.OpenedUtc=$null;$App.OpenRequestUtc=$null;$App.NegativeCount=0;$App.LastNegativeTicks=0L;$App.RecoveryCheckUtc=$null
+    $script:AppWindowSnapshotTicks=0;$script:HybridCapture=$null
+    $script:PoolActivePackage=$Package;$script:RecoveryScope='Game'
+    if($script:PoolRole -eq 'Monitor'){
+        $null=Request-MonitorQuickRecovery -Package $Package
+        Assert-PoolSetupTurn
+    }
+    if(-not (Test-EmulatorResponsive)) {
+        Close-NoRootManagedInstance
+        $failure=[OperationCanceledException]::new('Android is not responding. The emulator is closed and queued for a fresh setup turn.')
+        $failure.Data['PoolNeedsSetup']=$true;throw $failure
+    }
+    Invoke-Ld -Arguments @('killapp','--index',"$InstanceIndex",'--packagename',$Package)|Out-Null
+    Write-FlowStatus ($Reason+' App closed; reopening through setup.') -Key Recovery
+}
+function Update-LauncherEndpointUi {
+    param($Endpoint,[bool]$Running,[switch]$Resetting,[switch]$Unavailable)
+    if(-not $Ui -or -not $Ui.EndpointStatus){return}
+    if($Endpoint){$Ui.LastEndpointStatus=$Endpoint}
+    elseif(-not $Running -or $Resetting -or $Unavailable){$Endpoint=$Ui.LastEndpointStatus}
+    $model=Get-LauncherEndpointUiModel -Endpoint $Endpoint -Running $Running -Resetting:$Resetting -Unavailable:$Unavailable
+    $color=switch($model.Color){'Good'{[Drawing.Color]::FromArgb(135,211,159)};'Error'{[Drawing.Color]::FromArgb(255,135,140)};'Warning'{[Drawing.Color]::FromArgb(255,185,95)};'Checking'{[Drawing.Color]::FromArgb(125,185,250)};default{[Drawing.Color]::FromArgb(153,169,190)}}
+    Set-LauncherUiProperty $Ui.EndpointStatus Text $model.Text
+    Set-LauncherUiProperty $Ui.EndpointStatus ForeColor $color
+    if($Ui.EndpointTip -and $Ui.EndpointDetail -cne $model.Detail){$Ui.EndpointTip.SetToolTip($Ui.EndpointStatus,$model.Detail);$Ui.EndpointDetail=$model.Detail}
+}
+function Get-LauncherEndpointSnapshot {
+    if('LauncherPcPresence' -as [type]){return [LauncherPcPresence]::Snapshot()}
+    return @{State='Waiting';InFlight=$false;LastSuccessTicks=0L;RequestCount=0L}
+}
+function Get-LauncherEndpointUiModel {
+    param($Endpoint,[bool]$Running,[switch]$Resetting,[switch]$Unavailable,[datetime]$Now=[datetime]::UtcNow)
+    $last=''
+    if($Endpoint -and [long]$Endpoint.LastSuccessTicks -gt 0){
+        try{$last=[datetime]::new([long]$Endpoint.LastSuccessTicks,[DateTimeKind]::Utc).ToLocalTime().ToString('HH:mm:ss')}catch{}
+    }
+    $suffix=if($last){" | last success $last"}else{''}
+    if(-not $Running){return @{Text=('Roblox endpoint: stopped'+$suffix);Color='Neutral';Detail='No requests are sent while the tool is stopped.'}}
+    if($Resetting){return @{Text='Roblox endpoint: paused during reset';Color='Neutral';Detail='Requests resume during normal game checks.'}}
+    if($Unavailable){return @{Text=('Roblox endpoint: status unavailable'+$suffix);Color='Warning';Detail='Waiting for the worker status update.'}}
+    if(-not $Endpoint){return @{Text='Roblox endpoint: waiting for request status';Color='Neutral';Detail='No request result has been received from the workers yet.'}}
+    $detail=[string]$Endpoint.Error
+    if($Endpoint.RateLimit){$detail+="`r`nLast reported request limit: $($Endpoint.RateLimit)"}
+    if($Endpoint.RateRemaining -ne $null -and [string]$Endpoint.RateRemaining -ne ''){$detail+="`r`nRequests remaining in that response: $($Endpoint.RateRemaining)"}
+    $detail+="`r`nTotal HTTP requests this run: $($Endpoint.RequestCount)"
+    if($Endpoint.InFlight){return @{Text=('Roblox endpoint: requesting...'+$suffix);Color='Checking';Detail=$detail.Trim()}}
+    if($Endpoint.State -eq 'Error'){
+        $retry=0
+        if([long]$Endpoint.NextRequestTicks -gt $Now.Ticks){$retry=[int][math]::Ceiling(([long]$Endpoint.NextRequestTicks-$Now.Ticks)/[double][timespan]::TicksPerSecond)}
+        $state=if([int]$Endpoint.HttpStatus -eq 429){'rate limited (HTTP 429)'}elseif([int]$Endpoint.HttpStatus -gt 0){"failed (HTTP $($Endpoint.HttpStatus))"}else{'request failed'}
+        $wait=if($retry -gt 0){" | retry in ${retry}s"}else{' | waiting to retry'}
+        return @{Text=("Roblox endpoint: $state"+$wait+$suffix);Color='Error';Detail=$detail.Trim()}
+    }
+    if($Endpoint.State -eq 'Success' -and [int]$Endpoint.HttpStatus -eq 200 -and [long]$Endpoint.LastSuccessTicks -gt 0 -and [int]$Endpoint.RequestedCount -gt 0 -and $Endpoint.ReturnedCount -eq $Endpoint.RequestedCount){
+        if([long]$Endpoint.FreshUntilTicks -gt 0 -and $Now.Ticks -gt [long]$Endpoint.FreshUntilTicks){return @{Text=('Roblox endpoint: no recent response'+$suffix);Color='Warning';Detail=$detail.Trim()}}
+        return @{Text=("Roblox endpoint: OK (HTTP 200)"+$suffix+" | $($Endpoint.ReturnedCount)/$($Endpoint.RequestedCount) accounts");Color='Good';Detail=$detail.Trim()}
+    }
+    if($Endpoint.State -eq 'Incomplete'){
+        return @{Text=("Roblox endpoint: incomplete response ($($Endpoint.ReturnedCount)/$($Endpoint.RequestedCount) accounts)"+$suffix);Color='Warning';Detail=$detail.Trim()}
+    }
+    return @{Text=('Roblox endpoint: waiting for the first successful request'+$suffix);Color='Neutral';Detail=$detail.Trim()}
+}
 function Get-HybridMarkerPhase {
     param([int[]]$Bounds)
     Initialize-HybridStatusNative
@@ -411,6 +439,49 @@ function Get-HybridMarkerPhase {
         $script:HybridCapture=@{Key=$key;At=[datetime]::UtcNow;Bytes=$capture}
     }
     return [LauncherMarkerPixels]::Inspect($capture,$Bounds[0],$Bounds[1],$Bounds[2],$Bounds[3])
+}
+function Get-HybridAppState {
+    param($Instance)
+    if($script:HybridBoot -ne $Instance.ProcessId -or -not $script:HybridApps){
+        $script:HybridBoot=$Instance.ProcessId;$script:HybridApps=@{};$script:HybridPresenceSamples=@{}
+        foreach($package in $Config.GamePackages){$script:HybridApps[$package]=@{Ready=$false;LinkSentUtc=$null;JoiningUtc=$null;LastState='';LastNegativeTicks=0L;NegativeCount=0;Opened=$false;OpenedUtc=$null;OpenRequestUtc=$null;RecoveryCheckUtc=$null}}
+    }
+    return $script:HybridApps
+}
+function Get-HybridMarkerBounds {
+    param([string]$Windows,[string]$Package)
+    $owner='\bpackage='+[regex]::Escape($Package)+'(?:\s|$)'
+    $blocks=[regex]::Matches($Windows,'(?ms)^\s*Window #\d+\s+Window\{[^\r\n]*\}:(?<body>.*?)(?=^\s*Window #\d+\s+Window\{|^\s*mGlobalConfiguration=|\z)')
+    $selected=$null;$best=-1
+    foreach($block in $blocks){
+        $body=$block.Groups['body'].Value
+        if($body -cnotmatch $owner -or $body -match '\bty=(?:APPLICATION_OVERLAY|SYSTEM_ALERT)\b' -or $body -notmatch '\bmHasSurface=true\b' -or $body -notmatch '(?m)^\s*isVisible=true\s*$'){continue}
+        $frame=[regex]::Match($body,'\bmFrame=\[(-?\d+),(-?\d+)\]\[(-?\d+),(-?\d+)\]')
+        if(-not $frame.Success){continue}
+        $x=[int]$frame.Groups[1].Value;$y=[int]$frame.Groups[2].Value
+        $width=[int]$frame.Groups[3].Value-$x;$height=[int]$frame.Groups[4].Value-$y
+        if($width -lt 32 -or $height -lt 32){continue}
+        $native=$block.Value -match ('(?m)^\s*Window #\d+\s+Window\{[^\r\n]*'+[regex]::Escape($Package)+'/com[.]roblox[.]client[.]ActivityNativeMain(?:\s|\})')
+        $rank=if($native){2}else{1}
+        if($rank -gt $best){$selected=@($x,$y,$width,$height);$best=$rank}
+    }
+    return $selected
+}
+function Get-HybridWindowSnapshot {
+    param([datetime]$Deadline=[datetime]::UtcNow.AddSeconds($Config.CommandTimeout),[switch]$Fresh)
+    $ttl=[math]::Max(1,[math]::Min(3,$Config.PollInterval))
+    if(-not $Fresh -and $script:AppWindowSnapshotInstance -eq $InstanceIndex -and $script:AppWindowSnapshotTicks -gt 0){
+        $age=([Diagnostics.Stopwatch]::GetTimestamp()-$script:AppWindowSnapshotTicks)/[double][Diagnostics.Stopwatch]::Frequency
+        if($age -lt $ttl -and $script:AppWindowSnapshot -match 'LAUNCHER_PID:'){return $script:AppWindowSnapshot}
+    }
+    $command='shell for p in '+($Config.GamePackages -join ' ')+'; do echo LAUNCHER_PID:$p:$(pidof $p); done; dumpsys -t 5 window windows'
+    $remaining=[math]::Ceiling(($Deadline-[datetime]::UtcNow).TotalSeconds)
+    if($remaining -le 0){throw (New-GameStatusReadError 'The app-window check reached its deadline.')}
+    $windows=Invoke-Android $command -TimeoutSeconds ([math]::Min(6,$remaining))
+    $windows=$windows -replace '\r+\n',"`n"
+    if($windows -notmatch 'WINDOW MANAGER WINDOWS|mCurrentFocus=' -or $windows -match 'DUMP TIMEOUT'){throw (New-GameStatusReadError 'Android app-window state is unavailable.')}
+    $script:AppWindowSnapshot=$windows;$script:AppWindowSnapshotInstance=$InstanceIndex;$script:AppWindowSnapshotTicks=[Diagnostics.Stopwatch]::GetTimestamp()
+    return $windows
 }
 function Copy-CurrentInstanceReplacementSd {
     param($Settings,$Journal,[string]$Target)
@@ -5711,7 +5782,7 @@ function Publish-EmulatorWorkerStatus {
     $emulators=@()
     try{$emulators=@(foreach($record in @($Records|Where-Object{$_.Status -ne 'Retired'}|Sort-Object {[int]$_.Id})){Get-EmulatorLiveStatusModel $record -Stopped:$Stopped})}
     catch{} 
-    $document=@{Version=1;Workers=$models;Replacements=$replacements;Emulators=$emulators}
+    $document=@{Version=1;Workers=$models;Replacements=$replacements;Emulators=$emulators;Endpoint=(Get-LauncherEndpointSnapshot)}
     $fingerprint=ConvertTo-Json -InputObject $document -Depth 5 -Compress
     if($State.Fingerprint -ceq $fingerprint){return}
     try{
@@ -7050,12 +7121,13 @@ function Stop-LauncherUiRun {
 function Update-LauncherUiWorkerStatus {
     param([bool]$Running,$Record)
     if(-not $Ui.Workers){return}
-    if(-not $Running){Set-LauncherUiProperty $Ui.Workers Text 'Workers: stopped';if($Ui.EmulatorStatuses){Set-LauncherUiProperty $Ui.EmulatorStatuses Text 'Monitoring stopped'};return}
-    if($Ui.Operation -eq 'Reset'){Set-LauncherUiProperty $Ui.Workers Text 'Workers: waiting for Reset to finish';if($Ui.EmulatorStatuses){Set-LauncherUiProperty $Ui.EmulatorStatuses Text 'Resetting emulators...'};return}
-    if(-not $Record){Set-LauncherUiProperty $Ui.Workers Text 'Workers: starting...';if($Ui.EmulatorStatuses){Set-LauncherUiProperty $Ui.EmulatorStatuses Text 'Waiting for the first checks...'};return}
+    if(-not $Running){Update-LauncherEndpointUi -Running:$false;Set-LauncherUiProperty $Ui.Workers Text 'Workers: stopped';if($Ui.EmulatorStatuses){Set-LauncherUiProperty $Ui.EmulatorStatuses Text 'Monitoring stopped'};return}
+    if($Ui.Operation -eq 'Reset'){Update-LauncherEndpointUi -Running:$true -Resetting;Set-LauncherUiProperty $Ui.Workers Text 'Workers: waiting for Reset to finish';if($Ui.EmulatorStatuses){Set-LauncherUiProperty $Ui.EmulatorStatuses Text 'Resetting emulators...'};return}
+    if(-not $Record){Update-LauncherEndpointUi -Running:$true;Set-LauncherUiProperty $Ui.Workers Text 'Workers: starting...';if($Ui.EmulatorStatuses){Set-LauncherUiProperty $Ui.EmulatorStatuses Text 'Waiting for the first checks...'};return}
     $path=Join-Path $Record.RunDirectory 'worker-status.json'
     try{
         $status=ConvertFrom-Json ([IO.File]::ReadAllText($path))
+        Update-LauncherEndpointUi -Endpoint $status.Endpoint -Running:$true
         if($Ui.EmulatorStatuses){
             $entries=@($status.Emulators|Sort-Object {[int]$_.Id}|ForEach-Object{"$($_.Id): $($_.Status)"})
             $statusText=if($entries.Count){$entries -join '  |  '}else{'Waiting for the first checks...'}
@@ -7086,7 +7158,7 @@ function Update-LauncherUiWorkerStatus {
             }catch{}
         }
         Set-LauncherUiProperty $Ui.Workers Text $text
-    }catch{Set-LauncherUiProperty $Ui.Workers Text 'Workers: waiting for live assignments...'}
+    }catch{Update-LauncherEndpointUi -Running:$true -Unavailable;Set-LauncherUiProperty $Ui.Workers Text 'Workers: waiting for live assignments...'}
 }
 
 function Update-LauncherUi {
@@ -7284,10 +7356,15 @@ function Show-LauncherUi {
     $arrange.Add_Click({try{Start-LauncherUiWindowArrangement}catch{Set-LauncherUiProperty $Ui.ArrangeStatus Text $_.Exception.Message;Set-LauncherUiProperty $Ui.ArrangeStatus ForeColor ([Drawing.Color]::FromArgb(255,135,140))}})
     $progress=New-Object Windows.Forms.Label;$Ui.Progress=$progress;$progress.AutoSize=$true;$progress.Location=[Drawing.Point]::new(0,43);$policy.Controls.Add($progress)
     $backupLabel=New-Object Windows.Forms.Label;$Ui.Backup=$backupLabel;$backupLabel.AutoSize=$true;$backupLabel.Location=[Drawing.Point]::new(0,69);$policy.Controls.Add($backupLabel)
+    $endpoint=New-Object Windows.Forms.Label;$Ui.EndpointStatus=$endpoint
+    $endpoint.Location=[Drawing.Point]::new(0,92);$endpoint.Size=[Drawing.Size]::new([math]::Max(100,$policy.ClientSize.Width),20)
+    $endpoint.Font=[Drawing.Font]::new('Segoe UI',9);$endpoint.Anchor='Top,Left,Right';$endpoint.AutoEllipsis=$true
+    $endpoint.Text='Roblox endpoint: stopped';$policy.Controls.Add($endpoint)
+    $Ui.EndpointTip=New-Object Windows.Forms.ToolTip
     $workerDisplay=New-Object Windows.Forms.TextBox;$Ui.Workers=$workerDisplay
     $workerDisplay.ReadOnly=$true;$workerDisplay.Multiline=$true;$workerDisplay.WordWrap=$true;$workerDisplay.ScrollBars='Vertical'
     $workerDisplay.BorderStyle='None';$workerDisplay.BackColor=[Drawing.Color]::White;$workerDisplay.ForeColor=[Drawing.Color]::FromArgb(218,226,238)
-    $workerDisplay.Location=[Drawing.Point]::new(0,108);$workerDisplay.Size=[Drawing.Size]::new([math]::Max(100,$policy.ClientSize.Width),60)
+    $workerDisplay.Location=[Drawing.Point]::new(0,116);$workerDisplay.Size=[Drawing.Size]::new([math]::Max(100,$policy.ClientSize.Width),60)
     $workerDisplay.Anchor='Top,Left,Right';$workerDisplay.TabStop=$false;$workerDisplay.Text='Workers: stopped';$policy.Controls.Add($workerDisplay)
     $statusLabel=New-Object Windows.Forms.Label;$statusLabel.Text='LDPlayer status (latest checks)';$statusLabel.AutoSize=$true;$statusLabel.Location=[Drawing.Point]::new(0,184);$policy.Controls.Add($statusLabel)
     $emulatorStatuses=New-Object Windows.Forms.TextBox;$Ui.EmulatorStatuses=$emulatorStatuses
@@ -7375,7 +7452,7 @@ function Show-LauncherUi {
         Read-LauncherUiSettings;Read-LauncherUiAccounts;Update-LauncherUi;$timer.Start()
         $null=$form.ShowDialog()
     }finally{
-        $timer.Stop();$timer.Dispose();$form.Dispose()
+        $timer.Stop();$timer.Dispose();if($Ui.EndpointTip){$Ui.EndpointTip.Dispose()};$form.Dispose()
         if($Ui.ArrangeTask){$Ui.ArrangeTask.Worker.Stop();$Ui.ArrangeTask.Worker.Dispose()}
         if($Ui.ForceCloseTask){$Ui.ForceCloseTask.Worker.Stop();$Ui.ForceCloseTask.Worker.Dispose()}
         if($Ui.LogArchiveWriter){$Ui.LogArchiveWriter.Dispose();[IO.File]::Delete($Ui.LogArchivePath)}
